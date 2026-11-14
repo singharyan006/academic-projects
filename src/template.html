@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CapSortX · Automated Bottle Cap Sorting Robot</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<style>
+:root{
+  --bg:#111316; --panel:#171a1e; --panel2:#1c2025; --line:#2a3038; --line2:#353c46;
+  --tx:#d6dce4; --tx2:#97a3b0; --tx3:#66717d; --acc:#3b82f6; --acc2:#60a5fa;
+  --red:#ef4444; --green:#22c55e; --amber:#f59e0b; --cyan:#38bdf8;
+  --mono:"IBM Plex Mono",ui-monospace,monospace; --sans:"IBM Plex Sans",system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font:13px/1.4 var(--sans)}
+button,input,select{font:inherit;color:inherit}
+header{height:46px;display:flex;align-items:center;gap:16px;padding:0 14px;border-bottom:1px solid var(--line);background:#14171a}
+.brand{font:600 13px var(--mono);letter-spacing:.06em;white-space:nowrap}
+.brand small{color:var(--tx3);font-weight:400;margin-left:8px}
+.tabs{display:flex;gap:2px;margin-left:8px}
+.tab{white-space:nowrap;background:none;border:1px solid transparent;border-radius:4px;padding:5px 11px;color:var(--tx2);font:500 11.5px var(--mono);letter-spacing:.05em;cursor:pointer}
+.tab:hover{color:var(--tx)}
+.tab.on{color:var(--tx);border-color:var(--line2);background:var(--panel2)}
+.hdr-right{margin-left:auto;display:flex;gap:10px;align-items:center}
+.badge{font:500 10.5px var(--mono);letter-spacing:.05em;padding:3px 8px;border-radius:3px;border:1px solid var(--line2);color:var(--tx2);white-space:nowrap}
+.badge.sim{color:#93c5fd;border-color:#1e3a5f;background:#0f1d30}
+.pill{font:600 11px var(--mono);padding:3px 9px;border-radius:3px;background:#0f1d30;color:#93c5fd;border:1px solid #1e3a5f;white-space:nowrap}
+.pill.err{background:#2a1214;color:#fca5a5;border-color:#5b1f22}
+.pill.ok{background:#0f2418;color:#86efac;border-color:#1d4d2f}
+.view{display:none;height:calc(100% - 46px)}
+.view.on{display:grid}
+#simView{grid-template-columns:272px minmax(0,1fr) 300px;grid-template-rows:minmax(0,1fr) 220px;grid-template-areas:"left vp right" "left log right"}
+.panel{background:var(--panel);border-right:1px solid var(--line);overflow:auto;min-height:0}
+#left{grid-area:left}
+#right{grid-area:right;border-right:0;border-left:1px solid var(--line)}
+.sec{padding:16px 18px;border-bottom:1px solid var(--line)}
+.sec h3{margin:0 0 12px;font:600 11px var(--mono);letter-spacing:.09em;color:var(--tx3);text-transform:uppercase;display:flex;align-items:center;justify-content:space-between}
+.sec h3 span{color:var(--tx3);font-weight:400;letter-spacing:.03em}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;background:var(--panel2);border:1px solid var(--line2);border-radius:4px;padding:8px 10px;font:500 11.5px var(--mono);letter-spacing:.02em;cursor:pointer;color:var(--tx);transition:background .12s,border-color .12s}
+.btn:hover:not(:disabled){background:#232830;border-color:#46505c}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn.pri{background:#15305a;border-color:#2559a3;color:#dbeafe}
+.btn.pri:hover:not(:disabled){background:#1a3b6e}
+.btn.red{border-color:#6b2427;color:#fecaca}
+.btn.grn{border-color:#1f5a35;color:#bbf7d0}
+.btn.wide{width:100%}
+.btn svg{width:14px;height:14px;stroke-width:2}
+.seg{display:grid;grid-template-columns:1fr 1fr;border:1px solid var(--line2);border-radius:4px;overflow:hidden}
+.seg button{background:none;border:0;padding:6px;font:600 11px var(--mono);letter-spacing:.06em;color:var(--tx2);cursor:pointer}
+.seg button.on{background:#15305a;color:#dbeafe}
+.row{display:flex;align-items:center;gap:8px;margin-top:8px}
+.row label{font:500 11px var(--mono);color:var(--tx2);min-width:52px}
+input[type=range]{flex:1;accent-color:var(--acc);min-width:0}
+.val{font:500 11.5px var(--mono);min-width:48px;text-align:right}
+.joint{display:grid;grid-template-columns:62px 1fr 46px;gap:6px;align-items:center;margin-top:9px}
+.joint .nm{font:500 11px var(--mono);color:var(--tx)}
+.joint .nm small{display:block;color:var(--tx3);font-size:10px}
+.joint .v{font:600 12px var(--mono);text-align:right}
+.joint .t{grid-column:2/4;font:400 10px var(--mono);color:var(--tx3);margin-top:-4px;display:flex;justify-content:space-between}
+.hint{font-size:11px;color:var(--tx3);margin-top:7px}
+.caps{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.capbtn{display:flex;flex-direction:column;align-items:center;gap:4px;padding:7px 2px;background:var(--panel2);border:1px solid var(--line2);border-radius:4px;cursor:pointer;font:500 10.5px var(--mono);color:var(--tx2)}
+.capbtn:hover{border-color:#46505c;color:var(--tx)}
+.dot{width:16px;height:16px;border-radius:50%;box-shadow:inset 0 -2px 0 rgba(0,0,0,.3)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font:12px var(--mono)}
+.kv span:nth-child(odd){color:var(--tx3)}
+#vp{grid-area:vp;position:relative;min-height:0;background:#14171b}
+#vp canvas{display:block}
+.ov{position:absolute;pointer-events:none}
+.ov *{pointer-events:auto}
+#ovTL{top:10px;left:10px;display:flex;flex-direction:column;gap:6px}
+#statePill{font:600 13px var(--mono);letter-spacing:.04em;padding:6px 11px;border-radius:4px;background:rgba(15,29,48,.88);border:1px solid #1e3a5f;color:#bfdbfe;backdrop-filter:blur(4px)}
+#statePill small{display:block;font:400 10.5px var(--mono);color:#7aa2d6;margin-top:2px;letter-spacing:.03em}
+#statePill.err{background:rgba(42,18,20,.9);border-color:#5b1f22;color:#fecaca}
+#ovTR{top:10px;right:10px;display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end}
+#ovTR .btn{padding:4px 8px;font-size:10.5px;background:rgba(28,32,37,.85)}
+#ovTR .btn.on{border-color:#2559a3;color:#bfdbfe}
+#ovBL{bottom:10px;left:10px;font:10.5px var(--mono);color:var(--tx3);background:rgba(20,23,27,.75);padding:5px 8px;border-radius:3px}
+#errBox{position:absolute;left:50%;top:14px;transform:translateX(-50%);max-width:min(560px,80%);background:#2a1214;border:1px solid #7f1d1d;color:#fecaca;padding:10px 12px;border-radius:5px;font:12px var(--mono);display:none;gap:10px;align-items:center}
+#errBox.on{display:flex}
+#pausedTag{position:absolute;bottom:10px;right:10px;font:600 12px var(--mono);letter-spacing:.1em;color:var(--amber);border:1px solid #6b4a12;background:rgba(40,28,8,.85);padding:4px 10px;border-radius:3px;display:none}
+#logWrap{grid-area:log;border-top:1px solid var(--line);display:flex;flex-direction:column;min-height:0;background:#121417}
+.loghd{display:flex;align-items:center;gap:8px;padding:6px 12px;border-bottom:1px solid var(--line)}
+.loghd h3{margin:0;font:600 10.5px var(--mono);letter-spacing:.09em;color:var(--tx3);text-transform:uppercase;flex:1}
+.loghd label{font:11px var(--mono);color:var(--tx2);display:flex;gap:5px;align-items:center}
+.loghd .btn{padding:3px 8px;font-size:10.5px}
+#log{flex:1;overflow:auto;padding:6px 12px;font:12px/1.65 var(--mono)}
+#log div{white-space:pre-wrap}
+#log .ts{color:var(--tx3)}
+#log .st{color:#93c5fd} #log .ok{color:#86efac} #log .warn{color:#fcd34d} #log .error{color:#fca5a5} #log .data{color:#c4b5fd} #log .cmd{color:#67e8f9} #log .info{color:var(--tx2)}
+.meter{display:grid;grid-template-columns:26px 1fr 52px;gap:8px;align-items:center;margin-top:5px;font:11.5px var(--mono)}
+.meter .k{color:var(--tx2)}
+.bar{height:8px;background:#0e1013;border:1px solid var(--line);border-radius:2px;position:relative;overflow:visible}
+.bar i{position:absolute;left:0;top:0;bottom:0;border-radius:1px;transition:width .15s}
+.bar b{position:absolute;top:-3px;bottom:-3px;width:1px;background:#e5e7eb;opacity:.55}
+.meter .n{text-align:right}
+.detect{display:flex;align-items:center;gap:10px;margin-top:10px;padding:9px 10px;border:1px solid var(--line2);border-radius:4px;background:#121418}
+.detect .sw{width:28px;height:28px;border-radius:50%;border:1px solid #000}
+.detect .lbl{font:600 15px var(--mono);letter-spacing:.06em}
+.detect .sub{font:10.5px var(--mono);color:var(--tx3)}
+.sstat{font:600 10.5px var(--mono);padding:2px 7px;border-radius:3px;border:1px solid var(--line2);color:var(--tx2)}
+.sstat.SCANNING{color:#7dd3fc;border-color:#0c4a6e;background:#082f49}
+.sstat.POLLING,.sstat.LIVE{color:#93c5fd;border-color:#1e3a5f}
+.sstat.CLASSIFIED{color:#c4b5fd;border-color:#4c1d95}
+.sstat.HALTED{color:#fca5a5;border-color:#7f1d1d}
+table.rules{width:100%;border-collapse:collapse;font:11px var(--mono)}
+table.rules td{padding:3px 4px;border-bottom:1px solid #20252b}
+table.rules td:last-child{text-align:right;width:20px}
+.pass{color:#86efac}.fail{color:#4b5563}
+.grpH td{color:var(--tx3);font-size:10px;letter-spacing:.07em;padding-top:7px;text-align:left!important}
+table.rules td[colspan]{text-align:left}
+#states{list-style:none;margin:0;padding:0;font:11px var(--mono)}
+#states li{display:flex;align-items:center;gap:8px;padding:3px 6px;border-radius:3px;color:var(--tx3)}
+#states li .ix{width:18px;color:#4b5563}
+#states li.done{color:var(--tx2)}
+#states li.on{background:#15305a;color:#dbeafe}
+#states li.on .ix{color:#93c5fd}
+#states li.on.ERROR{background:#4b1518;color:#fecaca}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.stat{border:1px solid var(--line);border-radius:4px;padding:7px 9px;background:#14171b}
+.stat .k{font:10px var(--mono);color:var(--tx3);letter-spacing:.05em;text-transform:uppercase}
+.stat .v{font:600 18px var(--mono);margin-top:2px}
+.stat.wide{grid-column:1/3}
+.stat.wide .v{font-size:13px}
+/* hardware */
+#hwView{overflow:auto;display:none;grid-template-columns:minmax(0,1fr)}
+#hwView.on{display:block}
+.wrap{max-width:1180px;margin:0 auto}
+.wrap h2{font:600 13px var(--mono);letter-spacing:.09em;margin:6px 0 4px;text-transform:uppercase}
+.wrap p.lead{color:var(--tx2);margin:0 0 16px;max-width:820px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}
+.card h4{margin:0 0 14px;font:600 11px var(--mono);letter-spacing:.08em;color:var(--tx2);text-transform:uppercase}
+
+.svgbox{background:#0f1114;border:1px solid var(--line);border-radius:6px;padding:8px;overflow:auto}
+.svgbox svg{width:100%;min-width:900px;height:auto;display:block}
+table.pins{border-collapse:collapse;width:100%;font:12px var(--mono)}
+table.pins td,table.pins th{padding:5px 6px;border-bottom:1px solid #20252b;text-align:left}
+table.pins th{color:var(--tx3);font-weight:500;font-size:10.5px}
+.note{font-size:12.5px;color:var(--tx2)}
+.note li{margin:4px 0}
+.warnbox{border:1px solid #6b4a12;background:#1f1708;color:#fde68a;border-radius:5px;padding:10px 12px;font-size:12.5px;margin-top:10px}
+code{font:12px var(--mono);color:#bfdbfe}
+/* svghdr for hardware page */
+.svghdr{font:600 11px var(--mono);letter-spacing:.08em;color:var(--tx2);text-transform:uppercase;margin-bottom:8px;display:flex;justify-content:space-between;align-items:baseline}
+.svghdr span{font:400 11px var(--mono);color:var(--tx3);text-transform:none;letter-spacing:0}
+/* accordion toggle */
+.sec h3[data-toggle]{cursor:pointer;user-select:none}
+.tog{margin-left:6px;font-size:10px}
+/* card description */
+.card-desc{font:11.5px var(--sans);color:var(--tx3);margin:0 0 12px;line-height:1.5}
+/* test bench separator */
+.testbench-sep{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}
+/* hardware cards 3-col */
+#hwView .cards{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+/* build checklist */
+.cb{display:inline-block;width:14px;text-align:center;margin-right:4px;color:var(--tx3)}
+.chk-item{display:flex;align-items:flex-start;gap:4px;padding:3px 0;font:12px var(--mono);color:var(--tx2);border-bottom:1px solid #1a1f25}
+.chk-item:last-child{border-bottom:0}
+/* hardware warning callout */
+.hwwarn{background:#1f1708;border:1px solid #6b4a12;color:#fde68a;border-radius:6px;padding:10px 14px;font:12.5px var(--mono);margin-bottom:14px}
+@media (max-width:1150px){
+  #simView{grid-template-columns:1fr;grid-template-rows:62vh auto 240px auto;grid-template-areas:"vp" "left" "log" "right";height:auto;overflow:visible}
+  .view.on{height:auto}
+  .panel{border-right:0;border-bottom:1px solid var(--line)}
+  #left{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+  #right{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));border-left:0}
+  .badge.sim{display:none}
+}
+@media (max-width:640px){ .brand small{display:none} header{gap:8px;overflow-x:auto} }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">CAPSORTX<small>4-DOF ARM · AUTOMATED CONVEYOR TWIN</small></div>
+  <nav class="tabs">
+    <button class="tab on" data-view="simView">SIMULATION</button>
+    <button class="tab" data-view="hwView">HARDWARE ARCHITECTURE</button>
+  </nav>
+  <div class="hdr-right">
+    <a href="https://github.com/singharyan006/capsortx" target="_blank" rel="noopener noreferrer" class="badge" style="text-decoration:none;color:var(--tx2);display:inline-flex;align-items:center;gap:5px" title="View source repository on GitHub">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"></path></svg>
+      GITHUB
+    </a>
+    <span class="badge sim" title="No serial link implemented. All values are simulated in this browser.">LOCAL SIMULATION · NO ARDUINO CONNECTED</span>
+    <span class="pill" id="hdrState">IDLE</span>
+  </div>
+</header>
+
+<!-- ======================= SIMULATION ======================= -->
+<section id="simView" class="view on">
+  <aside id="left" class="panel">
+    <div class="sec">
+      <h3>Run control</h3>
+      <div class="grid2">
+        <button class="btn pri" id="bStart"><i data-lucide="play"></i>START</button>
+        <button class="btn" id="bPause"><i data-lucide="pause"></i>PAUSE</button>
+        <button class="btn" id="bReset"><i data-lucide="rotate-ccw"></i>RESET</button>
+        <button class="btn" id="bHome"><i data-lucide="house"></i>HOME</button>
+      </div>
+      <div class="row" style="margin-top:10px"><div class="seg" style="flex:1"><button id="mAuto" class="on">AUTOMATIC</button><button id="mMan">MANUAL</button></div></div>
+      <div class="row"><label>SPEED</label><input type="range" id="speed" min="0.25" max="3" step="0.05" value="1"><span class="val" id="speedV">1.00×</span></div>
+      <div class="hint">Base servo speed 60°/s at 1.00× (SG90 no-load is ~600°/s; slowed for visibility).</div>
+    </div>
+    <div class="sec">
+      <h3>Demonstration</h3>
+      <div style="display:grid;gap:6px">
+        <button class="btn red wide" id="dRed"><i data-lucide="circle-play"></i>FEED RED CAP</button>
+        <button class="btn grn wide" id="dGreen"><i data-lucide="circle-play"></i>FEED GREEN CAP</button>
+        <button class="btn wide" id="dBlue" style="border-color:#1d4ed8;color:#93c5fd"><i data-lucide="circle-play"></i>FEED BLUE CAP</button>
+        <button class="btn pri wide" id="dAll"><i data-lucide="list-video"></i>RUN COMPLETE CONVEYOR RUN</button>
+        <div class="grid2"><button class="btn" id="dReset"><i data-lucide="refresh-cw"></i>RESET SCENE</button><button class="btn" id="dClear"><i data-lucide="trash-2"></i>CLEAR BINS</button></div>
+      </div>
+      <div class="hint" id="demoStatus">Conveyor demo: feed red, green, blue or random/unknown caps.</div>
+    </div>
+    <div class="sec">
+      <h3>Load cap onto conveyor</h3>
+      <div class="caps">
+        <button class="capbtn" data-cap="RED"><span class="dot" style="background:#c72929"></span>RED</button>
+        <button class="capbtn" data-cap="GREEN"><span class="dot" style="background:#2e9e45"></span>GREEN</button>
+        <button class="capbtn" data-cap="BLUE"><span class="dot" style="background:#1f5ed1"></span>BLUE</button>
+        <button class="capbtn" data-cap="RANDOM"><span class="dot" style="background:conic-gradient(#e11d48,#f59e0b,#84cc16,#06b6d4,#8b5cf6,#e11d48)"></span>RANDOM</button>
+      </div>
+      <div class="row"><label>CUSTOM</label><input type="color" id="customCol" value="#d97706" style="width:38px;height:26px;border:1px solid var(--line2);background:none;padding:0"><button class="btn" id="bCustom" style="flex:1">LOAD</button><button class="btn" id="bRemove" title="Remove cap from inspection station">REMOVE</button></div>
+    </div>
+    <div class="sec">
+      <h3 data-toggle="▸">Joint control <span id="jointMode">AUTO · READ ONLY</span><span class="tog">▸</span></h3>
+      <div id="jointsWrap" style="display:none">
+      <div id="joints"></div>
+      <div class="grid2" style="margin-top:10px"><button class="btn" id="bSeq"><i data-lucide="route"></i>PLAY SEQUENCE</button><button class="btn" id="bSeqStop"><i data-lucide="square"></i>STOP</button></div>
+      <div class="hint">Manual mode: drag a slider and the joint moves to it at the set speed. Closing the gripper around a cap picks it up; opening releases it.</div>
+      </div>
+    </div>
+    <div class="sec">
+      <h3 data-toggle="▸">Grip point (forward kinematics)<span class="tog">▸</span></h3>
+      <div id="fkWrap" style="display:none">
+      <div class="kv" id="fkOut"></div>
+      </div>
+    </div>
+  </aside>
+
+  <div id="vp">
+    <div class="ov" id="ovTL"><div id="statePill">IDLE<small>AUTOMATIC · STOPPED</small></div></div>
+    <div class="ov" id="ovTR">
+      <button class="btn on" data-cam="persp">PERSPECTIVE</button><button class="btn" data-cam="top">TOP</button><button class="btn" data-cam="front">FRONT</button><button class="btn" data-cam="side">SIDE</button><button class="btn" id="bMarker">GRIP PT</button>
+    </div>
+    <div class="ov" id="ovBL">Drag: orbit · Right-drag: pan · Scroll: zoom · units: cm</div>
+    <div id="errBox"><span id="errMsg"></span><button class="btn red" id="errReset">RESET</button></div>
+    <div id="pausedTag">PAUSED</div>
+  </div>
+
+  <div id="logWrap">
+    <div class="loghd"><h3>Execution log</h3>
+      <label><input type="checkbox" id="showCmd"> servo commands</label>
+      <button class="btn" id="logCopy">COPY</button><button class="btn" id="logClear">CLEAR</button></div>
+    <div id="log"></div>
+  </div>
+
+  <aside id="right" class="panel">
+    <div class="sec">
+      <h3>TCS34725 colour sensor <span class="sstat" id="sStat">STANDBY</span></h3>
+      <div class="hint" style="margin:0 0 6px">I²C 0x29 · SDA A4 · SCL A5 · simulated</div>
+      <div id="rawM"></div>
+      <div style="height:8px"></div>
+      <div id="normM"></div>
+      <div class="detect"><div class="sw" id="detSw"></div><div><div class="lbl" id="detL">NO CAP</div><div class="sub" id="detS">live reading</div></div></div>
+    </div>
+    <div class="sec">
+      <h3 data-toggle="▸">Classification rules<span class="tog">▸</span></h3>
+      <div style="display:none">
+      <table class="rules" id="rules"></table>
+      </div>
+    </div>
+    <div class="sec">
+      <h3 data-toggle="▸">State machine<span class="tog">▸</span></h3>
+      <div style="display:none">
+      <ul id="states"></ul>
+      </div>
+    </div>
+    <div class="sec">
+      <h3>Statistics</h3>
+      <div class="stats">
+        <div class="stat"><div class="k">Caps processed</div><div class="v" id="stTotal">0</div></div>
+        <div class="stat"><div class="k">Sorting cycles</div><div class="v" id="stCycles">0</div></div>
+        <div class="stat"><div class="k" style="color:#f87171">Red → Bin 1</div><div class="v" id="stRed">0</div></div>
+        <div class="stat"><div class="k" style="color:#4ade80">Green → Bin 2</div><div class="v" id="stGreen">0</div></div>
+        <div class="stat"><div class="k" style="color:#60a5fa">Blue → Bin 3</div><div class="v" id="stBlue">0</div></div>
+        <div class="stat"><div class="k" style="color:#fbbf24">Unknown → Bin 4</div><div class="v" id="stUnk">0</div></div>
+        <div class="stat"><div class="k">Errors</div><div class="v" id="stErr">0</div></div>
+        <div class="stat"><div class="k">Current state</div><div class="v" id="stState" style="font-size:13px">IDLE</div></div>
+      </div>
+    </div>
+  </aside>
+</section>
+
+<!-- ======================= HARDWARE ======================= -->
+<section id="hwView" class="view">
+  <div class="wrap">
+    <h2>Hardware architecture</h2>
+    <p class="lead">Wiring of the physical prototype. Raw battery voltage (orange) only feeds the regulator and the Arduino VIN; the servos run from the regulated 5 V rail (red). All grounds are common.</p>
+    <div class="hwwarn">⚡ Never connect the raw 2S battery (7.4 V) directly to the servo rail. Always use a 5 V buck regulator/UBEC rated ≥ 3 A.</div>
+    <div class="svghdr">WIRING DIAGRAM<span>Schematic overview · not to scale</span></div>
+    <div class="svgbox" id="hwSvg"></div>
+    <div class="cards" style="margin-top:14px">
+      <div class="card"><h4>Pin map</h4>
+        <table class="pins"><tr><th>Arduino UNO</th><th>Connects to</th><th>Function</th></tr>
+          <tr><td>D3 (PWM)</td><td>Servo 1 signal</td><td>Base rotation</td></tr>
+          <tr><td>D5 (PWM)</td><td>Servo 2 signal</td><td>Shoulder</td></tr>
+          <tr><td>D6 (PWM)</td><td>Servo 3 signal</td><td>Elbow</td></tr>
+          <tr><td>D9 (PWM)</td><td>Servo 4 signal</td><td>Gripper</td></tr>
+          <tr><td>A4</td><td>TCS34725 SDA</td><td>I²C data</td></tr>
+          <tr><td>A5</td><td>TCS34725 SCL</td><td>I²C clock</td></tr>
+          <tr><td>5V</td><td>TCS34725 VIN</td><td>Sensor logic power</td></tr>
+          <tr><td>GND</td><td>TCS34725 GND, common GND</td><td>Reference</td></tr>
+          <tr><td>VIN</td><td>2S pack + (7.4 V nominal)</td><td>Board power via on-board regulator</td></tr>
+        </table></div>
+      <div class="card"><h4>Power notes</h4>
+        <ul class="note">
+          <li>2S Li-ion/LiPo: 7.4 V nominal, ~8.4 V fully charged, ~6.0–6.4 V when flat.</li>
+          <li>SG90s are 4.8–6 V parts. A raw 2S pack on the servo rail over-volts them. It must go through a 5 V buck/UBEC first.</li>
+          <li>Size the regulator for ~0.5–0.7 A per SG90 under load or stall: 4 servos → 2.5–3 A minimum.</li>
+          <li>Do not power the servos from the UNO 5V pin or USB. Simultaneous moves cause brown-outs and resets.</li>
+          <li>Put a 470–1000 µF electrolytic across the servo rail near the servos.</li>
+          <li>Servo GND, regulator GND and Arduino GND must be joined, or the PWM signals have no reference.</li>
+        </ul></div>
+      <div class="card"><h4>Firmware ↔ simulation mapping</h4>
+        <ul class="note">
+          <li><code>Servo.write()</code> targets ⇄ motion engine targets (enable “servo commands” in the log to see each command).</li>
+          <li><code>tcs.getRawData(&amp;r,&amp;g,&amp;b,&amp;c)</code> ⇄ simulated TCS34725 model (gain, ambient, noise).</li>
+          <li>Classifier thresholds ⇄ identical rule order and values (Calibration tab).</li>
+          <li>Sorting <code>switch(state)</code> ⇄ 15-state machine shown in the Simulation tab.</li>
+        </ul>
+        <div class="warnbox">No serial link is implemented. This page never talks to an Arduino. The simulation core exposes a servo-command event stream so a Web Serial bridge could be added later in a non-sandboxed build.</div></div>
+      <div class="card"><h4>Build Checklist</h4>
+        <div class="chk-item"><span class="cb">□</span>2S Li-ion/LiPo pack (7.4 V nominal)</div>
+        <div class="chk-item"><span class="cb">□</span>5 V buck regulator/UBEC, ≥ 3 A</div>
+        <div class="chk-item"><span class="cb">□</span>Arduino UNO (ATmega328P)</div>
+        <div class="chk-item"><span class="cb">□</span>4× SG90 servo motors</div>
+        <div class="chk-item"><span class="cb">□</span>TCS34725 RGB colour sensor module</div>
+        <div class="chk-item"><span class="cb">□</span>470–1000 µF capacitor across servo rail</div>
+        <div class="chk-item"><span class="cb">□</span>Common GND between all subsystems</div>
+        <div class="chk-item"><span class="cb">□</span>PWM wires: D3, D5, D6, D9</div>
+        <div class="chk-item"><span class="cb">□</span>I²C wires: A4 (SDA), A5 (SCL)</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+document.querySelectorAll('.sec h3[data-toggle]').forEach(function(h) {
+  h.style.cursor = 'pointer';
+  h.addEventListener('click', function() {
+    var content = h.nextElementSibling;
+    var isOpen = content.style.display !== 'none';
+    content.style.display = isOpen ? 'none' : '';
+    var ind = h.querySelector('.tog');
+    if (ind) ind.textContent = isOpen ? '▸' : '▾';
+  });
+});
+</script>
+<script>
+setTimeout(function(){ if(!window.__twinOK){ var d=document.createElement('div'); d.style.cssText='position:fixed;inset:46px 0 0 0;display:flex;align-items:center;justify-content:center;background:#111316;color:#fca5a5;font:14px IBM Plex Mono,monospace;padding:30px;text-align:center;z-index:9';
+d.textContent='The 3D engine (three.js from cdn.jsdelivr.net) did not load. Check your connection or content blocker and reload. No simulation is running.'; document.body.appendChild(d);} }, 15000);
+</script>
+<script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+<script type="module">
+/*BUNDLE*/
+</script>
+</body>
+</html>
