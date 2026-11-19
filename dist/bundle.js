@@ -1,0 +1,1682 @@
+// src/core.js
+var GEOM = {
+  H: 7.5,
+  // shoulder pivot height above bench (cm)
+  L1: 9,
+  // upper arm length
+  L2: 10,
+  // forearm length
+  LG: 5.5,
+  // wrist pivot -> grip point (gripper kept vertical by passive linkage)
+  PAD: { x: 0, z: 15, r: 2, h: 0.6 },
+  CAP: { r: 1.5, h: 1.3 },
+  TRAY: { dist: 15.5, inner: 6.8, wall: 2.4, floor: 0.3 },
+  CONVEYOR: {
+    startX: 0,
+    startZ: 38,
+    endX: 0,
+    endZ: 14.5,
+    width: 6,
+    height: 0.6,
+    speed: 7
+    // cm/s
+  },
+  GRIP: { gapAtZero: 0.2, gapPerDeg: 5 / 90 },
+  // finger gap (cm) vs gripper servo angle
+  CAPTURE: { horiz: 0.8, vert: 0.7 }
+  // tolerance for a successful grip
+};
+var BINS = {
+  BIN_RED: { id: "BIN_RED", label: "Red", color: "#dc2626", baseDeg: 155, key: "red" },
+  BIN_GREEN: { id: "BIN_GREEN", label: "Green", color: "#16a34a", baseDeg: 120, key: "green" },
+  BIN_BLUE: { id: "BIN_BLUE", label: "Blue", color: "#2563eb", baseDeg: 60, key: "blue" },
+  BIN_UNKNOWN: { id: "BIN_UNKNOWN", label: "Unknown", color: "#d97706", baseDeg: 25, key: "unknown" }
+};
+var JOINTS = ["base", "shoulder", "elbow", "gripper"];
+var DEFAULT_CONFIG = {
+  limits: {
+    base: { min: 10, max: 170, vmax: 60 },
+    shoulder: { min: 35, max: 165, vmax: 50 },
+    elbow: { min: 25, max: 160, vmax: 50 },
+    gripper: { min: 10, max: 90, vmax: 120 }
+  },
+  poses: {
+    HOME: { base: 90, shoulder: 90, elbow: 90, gripper: 40 },
+    PICKUP: { base: 90, shoulder: 143, elbow: 76 },
+    LIFT: { shoulder: 110, elbow: 78 },
+    BIN_RED: { base: 155, shoulder: 130, elbow: 64 },
+    BIN_GREEN: { base: 120, shoulder: 130, elbow: 64 },
+    BIN_BLUE: { base: 60, shoulder: 130, elbow: 64 },
+    BIN_UNKNOWN: { base: 25, shoulder: 130, elbow: 64 }
+  },
+  gripperOpen: 75,
+  gripperClosed: 15,
+  waitBeforePickup: 1,
+  // s, delay after opening gripper
+  sensor: {
+    gain: 1450,
+    // counts per unit reflectance (integration time + gain lumped)
+    chGain: [1, 1.08, 0.92],
+    // relative channel sensitivity R,G,B
+    ambient: 6,
+    // ambient counts per channel
+    clearScale: 0.8,
+    // clear channel ~ 0.8 * (R+G+B)
+    noisePct: 2,
+    // gaussian noise, % of signal
+    padRefl: 0.015,
+    // empty pad reflectance (matte black)
+    samples: 6
+    // readings averaged per identification
+  },
+  thresholds: {
+    redNrMin: 0.45,
+    redNgMax: 0.3,
+    greenNgMin: 0.41,
+    greenNrMax: 0.3,
+    greenNbMax: 0.29,
+    blueNbMin: 0.42,
+    blueNrMax: 0.25,
+    clearMin: 100
+  }
+};
+var clone = (o) => JSON.parse(JSON.stringify(o));
+var D2R = Math.PI / 180;
+var clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+function mulberry32(seed) {
+  return function() {
+    seed |= 0;
+    seed = seed + 1831565813 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+var TCS34725Model = class {
+  constructor(cfg, seed = 1234) {
+    this.cfg = cfg;
+    this.rand = mulberry32(seed);
+  }
+  gauss() {
+    let u = 0, v = 0;
+    while (u === 0) u = this.rand();
+    while (v === 0) v = this.rand();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+  // reflectance: [r,g,b] 0..1 of the surface under the sensor
+  read(reflectance) {
+    const s = this.cfg.sensor;
+    const ch = [0, 1, 2].map((i) => {
+      const ideal = s.ambient + reflectance[i] * s.chGain[i] * s.gain;
+      const n = this.gauss() * (ideal * s.noisePct / 100 + 1.5);
+      return clamp(Math.round(ideal + n), 0, 65535);
+    });
+    const cIdeal = s.clearScale * (ch[0] + ch[1] + ch[2]) + s.ambient;
+    const c = clamp(Math.round(cIdeal + this.gauss() * (cIdeal * s.noisePct / 100 + 1.5)), 0, 65535);
+    return { r: ch[0], g: ch[1], b: ch[2], c };
+  }
+};
+function normalize(rd) {
+  const sum = rd.r + rd.g + rd.b;
+  if (sum <= 0) return { nr: 0, ng: 0, nb: 0 };
+  return { nr: rd.r / sum, ng: rd.g / sum, nb: rd.b / sum };
+}
+function classify(rd, th) {
+  const n = normalize(rd);
+  const checks = {
+    clear: rd.c >= th.clearMin,
+    redNr: n.nr > th.redNrMin,
+    redNg: n.ng < th.redNgMax,
+    greenNg: n.ng > th.greenNgMin,
+    greenNr: n.nr < th.greenNrMax,
+    greenNb: n.nb < th.greenNbMax,
+    blueNb: n.nb > (th.blueNbMin || 0.42),
+    blueNr: n.nr < (th.blueNrMax || 0.25)
+  };
+  let label2 = "UNKNOWN";
+  if (!checks.clear) label2 = "NO CAP";
+  else if (checks.redNr && checks.redNg) label2 = "RED";
+  else if (checks.greenNg && checks.greenNr && checks.greenNb) label2 = "GREEN";
+  else if (checks.blueNb && checks.blueNr) label2 = "BLUE";
+  return { label: label2, n, checks };
+}
+function averageReadings(list) {
+  const a = { r: 0, g: 0, b: 0, c: 0 };
+  for (const x of list) {
+    a.r += x.r;
+    a.g += x.g;
+    a.b += x.b;
+    a.c += x.c;
+  }
+  const k = Math.max(1, list.length);
+  return { r: Math.round(a.r / k), g: Math.round(a.g / k), b: Math.round(a.b / k), c: Math.round(a.c / k) };
+}
+var yawOf = (base) => -(base - 90) * D2R;
+var shoulderPitch = (s) => (s - 90) * D2R;
+var elbowPitch = (e) => e * D2R;
+function fk(j) {
+  const G = GEOM;
+  const yaw = yawOf(j.base), a = shoulderPitch(j.shoulder), b = elbowPitch(j.elbow);
+  const er = G.L1 * Math.sin(a), ey = G.H + G.L1 * Math.cos(a);
+  const wr = er + G.L2 * Math.sin(a + b), wy = ey + G.L2 * Math.cos(a + b);
+  const toW = (r, y) => ({ x: r * Math.sin(yaw), y, z: r * Math.cos(yaw) });
+  return {
+    shoulder: toW(0, G.H),
+    elbow: toW(er, ey),
+    wrist: toW(wr, wy),
+    grip: toW(wr, wy - G.LG),
+    reach: wr,
+    yaw
+  };
+}
+var fingerGap = (g) => clamp(GEOM.GRIP.gapAtZero + g * GEOM.GRIP.gapPerDeg, 0.2, 6);
+var MotionEngine = class {
+  constructor(cfg, initial) {
+    this.cfg = cfg;
+    this.j = {};
+    for (const k of JOINTS) this.j[k] = { pos: initial[k], from: initial[k], to: initial[k], t: 0, dur: 0 };
+    this.speed = 1;
+    this.warnings = [];
+  }
+  angles() {
+    const o = {};
+    for (const k of JOINTS) o[k] = this.j[k].pos;
+    return o;
+  }
+  targets() {
+    const o = {};
+    for (const k of JOINTS) o[k] = this.j[k].to;
+    return o;
+  }
+  clampToLimits(k, v) {
+    const L = this.cfg.limits[k];
+    const c = clamp(v, L.min, L.max);
+    if (Math.abs(c - v) > 1e-6) this.warnings.push(`${k} target ${v.toFixed(0)}\xB0 clamped to limit ${c}\xB0`);
+    return c;
+  }
+  // Synchronised move: all listed joints start and finish together.
+  moveTo(target) {
+    let dur = 0;
+    const keys = Object.keys(target).filter((k) => JOINTS.includes(k) && target[k] !== void 0);
+    const dest = {};
+    for (const k of keys) {
+      dest[k] = this.clampToLimits(k, Number(target[k]));
+      const v = this.cfg.limits[k].vmax * this.speed;
+      dur = Math.max(dur, Math.abs(dest[k] - this.j[k].pos) / v);
+    }
+    dur = Math.max(0.08, dur * 1.5);
+    for (const k of keys) {
+      const J = this.j[k];
+      J.from = J.pos;
+      J.to = dest[k];
+      J.t = 0;
+      J.dur = dur;
+    }
+    return dur;
+  }
+  halt() {
+    for (const k of JOINTS) {
+      const J = this.j[k];
+      J.from = J.to = J.pos;
+      J.t = J.dur = 0;
+    }
+  }
+  step(dt) {
+    for (const k of JOINTS) {
+      const J = this.j[k];
+      if (J.t >= J.dur) {
+        J.pos = J.to;
+        continue;
+      }
+      J.t = Math.min(J.dur, J.t + dt);
+      const u = J.t / J.dur;
+      const e = u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2;
+      J.pos = J.from + (J.to - J.from) * e;
+    }
+  }
+  settled() {
+    return JOINTS.every((k) => this.j[k].t >= this.j[k].dur);
+  }
+};
+var CAP_PRESETS = {
+  RED: { name: "Red", rgb: [0.78, 0.16, 0.16] },
+  GREEN: { name: "Green", rgb: [0.18, 0.62, 0.27] },
+  BLUE: { name: "Blue", rgb: [0.12, 0.37, 0.82] }
+};
+function hslToRgb(h, s, l) {
+  const f = (n) => {
+    const k = (n + h * 12) % 12;
+    const a = s * Math.min(l, 1 - l);
+    return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+  };
+  return [f(0), f(8), f(4)];
+}
+var rgbToHex = (c) => "#" + c.map((v) => Math.round(clamp(v, 0, 1) * 255).toString(16).padStart(2, "0")).join("");
+var hexToRgb = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 255);
+function binFrame(binId) {
+  const b = BINS[binId];
+  if (!b) return null;
+  const yaw = -(b.baseDeg - 90) * D2R;
+  return { id: binId, yaw, cx: GEOM.TRAY.dist * Math.sin(yaw), cz: GEOM.TRAY.dist * Math.cos(yaw) };
+}
+function zoneAt(x, z) {
+  for (const binId of Object.keys(BINS)) {
+    const f = binFrame(binId);
+    const dx = x - f.cx, dz = z - f.cz;
+    const lx = dx * Math.cos(f.yaw) - dz * Math.sin(f.yaw);
+    const lz = dx * Math.sin(f.yaw) + dz * Math.cos(f.yaw);
+    const half = GEOM.TRAY.inner / 2;
+    if (Math.abs(lx) <= half && Math.abs(lz) <= half) return binId;
+  }
+  if (Math.hypot(x - GEOM.PAD.x, z - GEOM.PAD.z) <= GEOM.PAD.r) return "PAD";
+  return "BENCH";
+}
+function surfaceY(zone) {
+  if (zone && zone.startsWith("BIN_")) return GEOM.TRAY.floor;
+  if (zone === "PAD") return GEOM.PAD.h;
+  return 0;
+}
+var STATES = [
+  "IDLE",
+  "DETECTING_CAP",
+  "IDENTIFYING_COLOR",
+  "OPENING_GRIPPER",
+  "WAITING_FOR_PICKUP",
+  "MOVING_TO_PICKUP",
+  "CLOSING_GRIPPER",
+  "LIFTING_CAP",
+  "ROTATING_TO_BIN",
+  "MOVING_TO_DROP_POSITION",
+  "RELEASING_CAP",
+  "RETURNING_HOME",
+  "SORTING_COMPLETE",
+  "ERROR"
+];
+var Simulation = class {
+  constructor(cfg = clone(DEFAULT_CONFIG), seed = 1234) {
+    this.cfg = cfg;
+    this.sensor = new TCS34725Model(cfg, seed);
+    this.rand = mulberry32(seed + 7);
+    const home = { ...cfg.poses.HOME };
+    this.motion = new MotionEngine(cfg, home);
+    this.caps = [];
+    this.nextCapId = 1;
+    this.heldCap = null;
+    this.mode = "AUTO";
+    this.running = false;
+    this.paused = false;
+    this.time = 0;
+    this.listeners = [];
+    this.stats = { total: 0, red: 0, green: 0, blue: 0, unknown: 0, cycles: 0, errors: 0 };
+    this.reading = { r: 0, g: 0, b: 0, c: 0 };
+    this.result = classify(this.reading, cfg.thresholds);
+    this.sensorStatus = "STANDBY";
+    this.awaitPadClear = false;
+    this.target = null;
+    this.lastPadMsg = "";
+    this.error = "";
+    this.seq = null;
+    this.handlers = this.makeHandlers();
+    this.sd = {};
+    this.state = "IDLE";
+    this.stateTime = 0;
+    this.pollT = 0;
+    this.log("info", "Simulation core initialised. TCS34725 model ready (local simulation, no hardware link).");
+  }
+  // ---- events
+  on(fn) {
+    this.listeners.push(fn);
+  }
+  emit(type, data) {
+    for (const f of this.listeners) f(type, data);
+  }
+  log(level, msg) {
+    this.emit("log", { level, msg, t: this.time });
+  }
+  // ---- state machine plumbing
+  go(next, why) {
+    const prev = this.state;
+    this.state = next;
+    this.stateTime = 0;
+    this.sd = {};
+    this.emit("state", { prev, next });
+    if (why) this.log(next === "ERROR" ? "error" : "state", why);
+    const h = this.handlers[next];
+    if (h && h.enter) h.enter.call(this);
+  }
+  fail(msg) {
+    this.error = msg;
+    this.stats.errors++;
+    this.motion.halt();
+    this.go("ERROR", `ERROR: ${msg}`);
+  }
+  move(pose, keys) {
+    const t = {};
+    for (const k of keys) if (pose[k] !== void 0) t[k] = pose[k];
+    this.motion.moveTo(t);
+    const a = this.motion.targets();
+    this.emit("cmd", a);
+    this.flushWarnings();
+  }
+  flushWarnings() {
+    while (this.motion.warnings.length) this.log("warn", this.motion.warnings.shift());
+  }
+  makeHandlers() {
+    const P = () => this.cfg.poses;
+    return {
+      IDLE: {
+        enter() {
+          this.target = null;
+          this.sensorStatus = "POLLING";
+        },
+        update(dt) {
+          this.pollT -= dt;
+          const auto = this.mode === "AUTO" && this.running;
+          this.sensorStatus = auto ? "POLLING" : "LIVE";
+          if (this.pollT > 0) return;
+          this.pollT = 0.4;
+          if (!auto) {
+            this.readSensor();
+            return;
+          }
+          const rd = this.readSensor();
+          const res = this.result;
+          if (res.label === "NO CAP") {
+            if (this.awaitPadClear) {
+              this.awaitPadClear = false;
+              this.log("info", "Pickup pad clear. Ready for next cap.");
+            }
+            this.padMsg("NO CAP DETECTED");
+            return;
+          }
+          if (this.awaitPadClear) {
+            this.padMsg("Rejected cap still on pad. Remove it to continue.");
+            return;
+          }
+          this.lastPadMsg = "";
+          this.go("DETECTING_CAP", `Bottle cap detected (clear = ${rd.c} \u2265 ${this.cfg.thresholds.clearMin}).`);
+        }
+      },
+      DETECTING_CAP: {
+        enter() {
+          this.sd.samples = [];
+          this.sd.t = 0;
+          this.sensorStatus = "SCANNING";
+        },
+        update(dt) {
+          this.sd.t -= dt;
+          if (this.sd.t <= 0) {
+            this.sd.samples.push(this.readSensor());
+            this.sd.t = 0.15;
+          }
+          if (this.sd.samples.length >= this.cfg.sensor.samples) this.go("IDENTIFYING_COLOR", `Collected ${this.sd.samples.length} RGBC samples.`);
+        }
+      },
+      IDENTIFYING_COLOR: {
+        enter() {
+          const avg = averageReadings(this.sd.samples || [this.readSensor()]);
+          this.reading = avg;
+          this.result = classify(avg, this.cfg.thresholds);
+          this.emit("reading", { reading: avg, result: this.result, averaged: true });
+          const n = this.result.n;
+          this.log("data", `Avg R=${avg.r} G=${avg.g} B=${avg.b} C=${avg.c} | nr=${n.nr.toFixed(3)} ng=${n.ng.toFixed(3)} nb=${n.nb.toFixed(3)}`);
+          this.sensorStatus = "CLASSIFIED";
+        },
+        update() {
+          if (this.stateTime < 0.5) return;
+          const L = this.result.label;
+          if (L === "RED" || L === "GREEN" || L === "BLUE" || L === "UNKNOWN") {
+            const map = {
+              RED: "BIN_RED",
+              GREEN: "BIN_GREEN",
+              BLUE: "BIN_BLUE",
+              UNKNOWN: "BIN_UNKNOWN"
+            };
+            this.target = map[L];
+            this.log("ok", `${L} colour recognized. Destination: ${this.target} (${BINS[this.target].label}).`);
+            this.go("OPENING_GRIPPER");
+          } else {
+            this.log("warn", "Cap lost during identification (clear below threshold).");
+            this.go("IDLE");
+          }
+        }
+      },
+      OPENING_GRIPPER: {
+        enter() {
+          this.move({ gripper: this.cfg.gripperOpen }, ["gripper"]);
+        },
+        update() {
+          if (this.motion.settled()) {
+            this.log("state", "Gripper opened.");
+            this.go("WAITING_FOR_PICKUP");
+          }
+        }
+      },
+      WAITING_FOR_PICKUP: {
+        update() {
+          if (this.stateTime >= this.cfg.waitBeforePickup) this.go("MOVING_TO_PICKUP", "Moving to pickup position.");
+        }
+      },
+      MOVING_TO_PICKUP: {
+        enter() {
+          this.move(P().PICKUP, ["base", "shoulder", "elbow"]);
+        },
+        update() {
+          if (this.motion.settled()) this.go("CLOSING_GRIPPER");
+        }
+      },
+      CLOSING_GRIPPER: {
+        enter() {
+          this.move({ gripper: this.cfg.gripperClosed }, ["gripper"]);
+        },
+        update() {
+          if (this.heldCap && this.motion.settled()) {
+            this.log("ok", "Gripper closed. Cap secured.");
+            this.go("LIFTING_CAP");
+            return;
+          }
+          if (this.motion.settled()) {
+            const c = this.padCap();
+            const g = fk(this.motion.angles()).grip;
+            const d = c ? `grip point ${Math.hypot(g.x - c.pos.x, g.z - c.pos.z).toFixed(1)} cm from cap centre (horiz), ${(g.y - c.pos.y).toFixed(1)} cm vertical` : "no cap on pad";
+            this.fail(`Grip failed: ${d}. Recalibrate PICKUP pose.`);
+          }
+        }
+      },
+      LIFTING_CAP: {
+        enter() {
+          this.move(P().LIFT, ["shoulder", "elbow"]);
+        },
+        update() {
+          if (!this.motion.settled()) return;
+          this.log("state", "Cap lifted.");
+          this.go("ROTATING_TO_BIN", `Rotating to ${this.target}.`);
+        }
+      },
+      ROTATING_TO_BIN: {
+        enter() {
+          const targetPose = P()[this.target] || P().HOME;
+          this.move({ base: targetPose.base }, ["base"]);
+        },
+        update() {
+          if (this.motion.settled()) this.go("MOVING_TO_DROP_POSITION");
+        }
+      },
+      MOVING_TO_DROP_POSITION: {
+        enter() {
+          const targetPose = P()[this.target] || P().HOME;
+          this.move({ shoulder: targetPose.shoulder, elbow: targetPose.elbow }, ["shoulder", "elbow"]);
+        },
+        update() {
+          if (this.motion.settled()) this.go("RELEASING_CAP");
+        }
+      },
+      RELEASING_CAP: {
+        enter() {
+          this.sd.cap = this.heldCap;
+          if (!this.sd.cap) {
+            this.fail("No cap in gripper at release.");
+            return;
+          }
+          this.move({ gripper: this.cfg.gripperOpen }, ["gripper"]);
+        },
+        update() {
+          const cap = this.sd.cap;
+          if (!this.motion.settled() || !cap || cap.state === "held" || cap.state === "falling") return;
+          if (this.sd.done) return;
+          this.sd.done = true;
+          if (cap.zone === this.target) {
+            this.stats.total++;
+            const binInfo = BINS[this.target];
+            if (binInfo && this.stats[binInfo.key] !== void 0) {
+              this.stats[binInfo.key]++;
+            }
+            this.emit("stats");
+            this.log("ok", `Cap released into ${this.target} (${binInfo ? binInfo.label : ""}).`);
+            this.go("RETURNING_HOME", "Returning HOME.");
+          } else {
+            this.fail(`Cap landed in ${cap.zone} instead of ${this.target} zone. Check ${this.target} pose.`);
+          }
+        }
+      },
+      RETURNING_HOME: {
+        enter() {
+          this.move(P().HOME, ["base", "shoulder", "elbow", "gripper"]);
+        },
+        update() {
+          if (this.motion.settled()) this.go("SORTING_COMPLETE");
+        }
+      },
+      SORTING_COMPLETE: {
+        enter() {
+          this.stats.cycles++;
+          this.emit("stats");
+          this.log("ok", "Sorting complete.");
+        },
+        update() {
+          if (this.stateTime >= 0.6) this.go("IDLE");
+        }
+      },
+      ERROR: { enter() {
+        this.sensorStatus = "HALTED";
+      }, update() {
+      } }
+    };
+  }
+  padMsg(m) {
+    if (this.lastPadMsg !== m) {
+      this.lastPadMsg = m;
+      this.log("info", m);
+    }
+  }
+  // ---- sensor
+  padCap() {
+    return this.caps.find((c) => c.state === "resting" && c.zone === "PAD") || null;
+  }
+  readSensor() {
+    const c = this.padCap();
+    const refl = c ? c.rgb : [this.cfg.sensor.padRefl, this.cfg.sensor.padRefl, this.cfg.sensor.padRefl];
+    const rd = this.sensor.read(refl);
+    this.reading = rd;
+    this.result = classify(rd, this.cfg.thresholds);
+    this.emit("reading", { reading: rd, result: this.result, averaged: false });
+    return rd;
+  }
+  // ---- caps
+  spawnCap(kind, hex, onConveyor = true) {
+    if (onConveyor) {
+      const nearInfeed = this.caps.find((c) => Math.hypot(c.pos.x - GEOM.CONVEYOR.startX, c.pos.z - GEOM.CONVEYOR.startZ) < GEOM.CAP.r * 2.5);
+      if (nearInfeed) {
+        this.log("warn", "Conveyor infeed is currently occupied.");
+        return null;
+      }
+    } else {
+      const occupied = this.caps.find((c) => c.zone === "PAD" && c.state === "resting" || c.state === "spawning");
+      if (occupied) {
+        this.log("warn", "Pickup position occupied. Wait or remove the current cap first.");
+        return null;
+      }
+    }
+    let rgb, name;
+    if (CAP_PRESETS[kind]) {
+      rgb = [...CAP_PRESETS[kind].rgb];
+      name = CAP_PRESETS[kind].name;
+    } else if (kind === "RANDOM") {
+      rgb = hslToRgb(this.rand(), 0.55 + this.rand() * 0.4, 0.3 + this.rand() * 0.25);
+      name = "Random";
+    } else if (kind === "CUSTOM") {
+      rgb = hexToRgb(hex);
+      name = "Custom";
+    } else return null;
+    const startX = onConveyor ? GEOM.CONVEYOR.startX : GEOM.PAD.x;
+    const startZ = onConveyor ? GEOM.CONVEYOR.startZ : GEOM.PAD.z;
+    const startY = onConveyor ? GEOM.CONVEYOR.height + GEOM.CAP.h / 2 : GEOM.PAD.h + GEOM.CAP.h / 2 + 5;
+    const cap = {
+      id: this.nextCapId++,
+      name,
+      rgb,
+      hex: rgbToHex(rgb),
+      pos: { x: startX, y: startY, z: startZ },
+      vy: 0,
+      state: onConveyor ? "conveyor" : "spawning",
+      zone: onConveyor ? null : "PAD"
+    };
+    this.caps.push(cap);
+    this.emit("caps");
+    this.log("info", `${name} cap (${cap.hex}) loaded ${onConveyor ? "onto conveyor belt" : "at pickup pad"}.`);
+    return cap;
+  }
+  removePadCap() {
+    const c = this.padCap() || this.caps.find((c2) => c2.state === "conveyor" && Math.hypot(c2.pos.x - GEOM.PAD.x, c2.pos.z - GEOM.PAD.z) < 2);
+    if (!c) {
+      this.log("info", "No cap at pickup station.");
+      return;
+    }
+    this.caps = this.caps.filter((x) => x !== c);
+    this.emit("caps");
+    this.log("info", "Operator removed cap from pickup station.");
+  }
+  clearTrays() {
+    const n = this.caps.length;
+    this.caps = this.caps.filter((c) => !(c.state === "resting" && (c.zone && (c.zone.startsWith("BIN_") || c.zone === "BENCH"))));
+    this.emit("caps");
+    this.log("info", `Sorting containers cleared (${n - this.caps.length} caps removed).`);
+  }
+  updateCaps(dt) {
+    const G = GEOM;
+    const j = this.motion.angles();
+    const f = fk(j);
+    const gap = fingerGap(j.gripper);
+    const dia = 2 * G.CAP.r;
+    const conv = G.CONVEYOR;
+    const padOccupied = this.caps.some((c) => c.zone === "PAD" && c.state === "resting");
+    for (const c of this.caps) {
+      if (c.state === "conveyor") {
+        const distToPad = c.pos.z - G.PAD.z;
+        if (distToPad <= 0.05) {
+          c.pos.x = G.PAD.x;
+          c.pos.z = G.PAD.z;
+          c.pos.y = G.PAD.h + G.CAP.h / 2;
+          c.state = "resting";
+          c.zone = "PAD";
+          this.emit("caps");
+          this.log("info", `${c.name} cap arrived at inspection station.`);
+        } else {
+          let canMove = !padOccupied || distToPad > 2.8;
+          for (const o of this.caps) {
+            if (o === c) continue;
+            if (Math.abs(o.pos.x - c.pos.x) < 2 && o.pos.z < c.pos.z && c.pos.z - o.pos.z < 3.2) {
+              canMove = false;
+              break;
+            }
+          }
+          if (canMove) {
+            c.pos.z -= conv.speed * dt;
+          }
+        }
+      }
+    }
+    if (this.heldCap) {
+      const c = this.heldCap;
+      c.pos = { ...f.grip };
+      if (gap >= dia + 0.3) {
+        c.state = "falling";
+        c.vy = 0;
+        this.heldCap = null;
+        this.emit("caps");
+        this.log("state", "Gripper released cap.");
+      }
+    } else if (gap <= dia) {
+      for (const c of this.caps) {
+        if (c.state !== "resting") continue;
+        const h = Math.hypot(f.grip.x - c.pos.x, f.grip.z - c.pos.z);
+        const v = Math.abs(f.grip.y - c.pos.y);
+        if (h <= G.CAPTURE.horiz && v <= G.CAPTURE.vert && this.sd_gripWasOpen) {
+          c.state = "held";
+          c.zone = null;
+          this.heldCap = c;
+          this.emit("caps");
+          this.log("state", "Fingers in contact with cap.");
+          break;
+        }
+      }
+    }
+    this.sd_gripWasOpen = gap > dia + 0.2 ? true : gap <= dia ? false : this.sd_gripWasOpen;
+    if (this.heldCap) this.sd_gripWasOpen = false;
+    for (const c of this.caps) {
+      if (c.state !== "falling" && c.state !== "spawning") continue;
+      c.vy -= 981 * dt;
+      c.pos.y += c.vy * dt;
+      const zone = zoneAt(c.pos.x, c.pos.z);
+      let floor = surfaceY(zone) + G.CAP.h / 2;
+      for (const o of this.caps) {
+        if (o === c || o.state !== "resting") continue;
+        if (Math.hypot(o.pos.x - c.pos.x, o.pos.z - c.pos.z) < 2 * G.CAP.r * 0.9) floor = Math.max(floor, o.pos.y + G.CAP.h);
+      }
+      if (c.pos.y <= floor) {
+        c.pos.y = floor;
+        c.vy = 0;
+        c.state = "resting";
+        c.zone = zone;
+        this.emit("caps");
+        const binInfo = BINS[zone];
+        if (binInfo) this.log("info", `Cap landed in ${binInfo.label} container.`);
+        else if (zone !== "PAD") this.log("info", `Cap landed: ${zone === "BENCH" ? "on bench (outside containers)" : zone}.`);
+      }
+    }
+  }
+  // ---- manual sequence player (predefined demo motion, no gripping logic needed)
+  playSequence() {
+    if (this.mode !== "MANUAL") {
+      this.log("warn", "Switch to MANUAL mode to play the movement sequence.");
+      return;
+    }
+    const P = this.cfg.poses;
+    this.seq = {
+      i: -1,
+      steps: [
+        ["HOME", P.HOME],
+        ["PICKUP", { ...P.PICKUP, gripper: this.cfg.gripperOpen }],
+        ["LIFT", P.LIFT],
+        ["BIN_RED", P.BIN_RED],
+        ["BIN_GREEN", P.BIN_GREEN],
+        ["BIN_BLUE", P.BIN_BLUE],
+        ["BIN_UNKNOWN", P.BIN_UNKNOWN],
+        ["HOME", P.HOME]
+      ]
+    };
+    this.log("info", "Playing predefined movement sequence across all 4 bins.");
+  }
+  stopSequence() {
+    if (this.seq) {
+      this.seq = null;
+      this.log("info", "Sequence stopped.");
+    }
+  }
+  // ---- controls
+  setMode(m) {
+    if (m === this.mode) return;
+    if (m === "MANUAL" && this.state !== "IDLE" && this.state !== "ERROR") {
+      this.motion.halt();
+      this.log("warn", `Auto cycle aborted in ${this.state} (switched to MANUAL).`);
+      this.go("IDLE");
+    }
+    this.mode = m;
+    this.seq = null;
+    this.log("info", `${m} mode.`);
+    this.emit("mode");
+  }
+  start() {
+    if (this.state === "ERROR") {
+      this.log("warn", "Clear the error with RESET first.");
+      return;
+    }
+    this.setMode("AUTO");
+    if (!this.running) {
+      this.running = true;
+      this.paused = false;
+      this.log("info", "Automatic sorting started. Polling sensor.");
+    }
+    this.emit("mode");
+  }
+  stop() {
+    this.running = false;
+    this.emit("mode");
+  }
+  setPaused(p) {
+    this.paused = p;
+    this.log("info", p ? "Simulation paused." : "Simulation resumed.");
+    this.emit("mode");
+  }
+  home() {
+    if (this.mode === "AUTO" && this.running && this.state !== "IDLE" && this.state !== "ERROR") {
+      this.log("warn", "Robot busy. Switch to MANUAL or RESET to send HOME.");
+      return;
+    }
+    this.seq = null;
+    this.move(this.cfg.poses.HOME, JOINTS);
+    this.log("info", "Moving to HOME.");
+  }
+  reset() {
+    this.seq = null;
+    this.error = "";
+    this.running = false;
+    this.paused = false;
+    this.awaitPadClear = false;
+    this.lastPadMsg = "";
+    if (this.heldCap) {
+      this.heldCap.state = "falling";
+      this.heldCap = null;
+    }
+    this.motion.halt();
+    this.go("IDLE", "Controller reset.");
+    this.move(this.cfg.poses.HOME, JOINTS);
+    this.emit("mode");
+  }
+  resetScene() {
+    this.caps = [];
+    this.heldCap = null;
+    this.stats = { total: 0, red: 0, green: 0, unknown: 0, cycles: 0, errors: 0 };
+    this.reset();
+    this.emit("caps");
+    this.emit("stats");
+    this.log("info", "Scene reset: caps removed, statistics cleared.");
+  }
+  manualJoint(k, v) {
+    if (this.mode !== "MANUAL") return;
+    this.seq = null;
+    this.motion.moveTo({ [k]: v });
+    this.flushWarnings();
+  }
+  // ---- main step
+  step(dt) {
+    if (this.paused) return;
+    dt = Math.min(dt, 0.05);
+    this.time += dt;
+    this.stateTime += dt;
+    this.motion.step(dt);
+    if (this.seq && this.motion.settled()) {
+      this.seq.i++;
+      if (this.seq.i >= this.seq.steps.length) {
+        this.seq = null;
+        this.log("info", "Sequence finished.");
+      } else {
+        const [name, pose] = this.seq.steps[this.seq.i];
+        this.move(pose, JOINTS);
+        this.log("state", `Sequence \u2192 ${name}`);
+      }
+    }
+    this.updateCaps(dt);
+    const h = this.handlers[this.state];
+    if (h.update) h.update.call(this, dt);
+  }
+};
+
+// src/render.js
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+var MAT = {
+  mdf: new THREE.MeshStandardMaterial({ color: 12095839, roughness: 0.85 }),
+  mdfLight: new THREE.MeshStandardMaterial({ color: 13214835, roughness: 0.8 }),
+  servo: new THREE.MeshStandardMaterial({ color: 2056127, roughness: 0.45, metalness: 0.05 }),
+  horn: new THREE.MeshStandardMaterial({ color: 15921904, roughness: 0.5 }),
+  screw: new THREE.MeshStandardMaterial({ color: 10134445, roughness: 0.35, metalness: 0.8 }),
+  acrylic: new THREE.MeshStandardMaterial({ color: 1382170, roughness: 0.25, metalness: 0.1 }),
+  bench: new THREE.MeshStandardMaterial({ color: 2764598, roughness: 0.95 }),
+  pad: new THREE.MeshStandardMaterial({ color: 855568, roughness: 0.95 }),
+  rubber: new THREE.MeshStandardMaterial({ color: 2237480, roughness: 0.9 }),
+  pcbBlue: new THREE.MeshStandardMaterial({ color: 946048, roughness: 0.6 }),
+  pcbPurple: new THREE.MeshStandardMaterial({ color: 5909900, roughness: 0.55 }),
+  chip: new THREE.MeshStandardMaterial({ color: 1579291, roughness: 0.5 }),
+  metal: new THREE.MeshStandardMaterial({ color: 13094098, roughness: 0.3, metalness: 0.9 }),
+  bracket: new THREE.MeshStandardMaterial({ color: 3883337, roughness: 0.6, metalness: 0.3 })
+};
+function box(w, h, d, mat, x = 0, y = 0, z = 0) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z);
+  m.castShadow = true;
+  m.receiveShadow = true;
+  return m;
+}
+function cyl(r, h, mat, seg = 32) {
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, h, seg), mat);
+  m.castShadow = true;
+  m.receiveShadow = true;
+  return m;
+}
+function sg90(withHorn = true) {
+  const g = new THREE.Group();
+  const body = box(1.22, 2.25, 2.3, MAT.servo);
+  g.add(body);
+  g.add(box(1.22, 0.25, 3.2, MAT.servo, 0, 0.45, 0));
+  const top = cyl(0.55, 0.45, MAT.servo);
+  top.rotation.z = Math.PI / 2;
+  top.position.set(0.8, 0, 0.55);
+  g.add(top);
+  if (withHorn) {
+    const horn = cyl(0.42, 0.15, MAT.horn);
+    horn.rotation.z = Math.PI / 2;
+    horn.position.set(1.08, 0, 0.55);
+    g.add(horn);
+  }
+  return g;
+}
+function label(text, color = "#9fb3c8", w = 12, h = 2.2) {
+  const c = document.createElement("canvas");
+  c.width = 512;
+  c.height = Math.round(512 * h / w);
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = color;
+  ctx.font = `600 ${Math.round(c.height * 0.5)}px "IBM Plex Mono", monospace`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, c.width / 2, c.height / 2);
+  const tex = new THREE.CanvasTexture(c);
+  tex.anisotropy = 4;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false }));
+  m.rotation.x = -Math.PI / 2;
+  m.position.y = 0.03;
+  return m;
+}
+var SceneView = class {
+  constructor(container, sim2) {
+    this.sim = sim2;
+    this.container = container;
+    const r = this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    r.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    r.shadowMap.enabled = true;
+    r.shadowMap.type = THREE.PCFSoftShadowMap;
+    container.appendChild(r.domElement);
+    const scene = this.scene = new THREE.Scene();
+    scene.background = new THREE.Color(1316635);
+    this.camera = new THREE.PerspectiveCamera(42, 1, 0.5, 600);
+    this.controls = new OrbitControls(this.camera, r.domElement);
+    this.controls.enableDamping = true;
+    this.controls.maxPolarAngle = Math.PI * 0.495;
+    this.controls.minDistance = 12;
+    this.controls.maxDistance = 160;
+    this.setView("persp");
+    scene.add(new THREE.HemisphereLight(14542581, 1711394, 0.85));
+    const sun = new THREE.DirectionalLight(16777215, 1.7);
+    sun.position.set(22, 48, 30);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    Object.assign(sun.shadow.camera, { left: -45, right: 45, top: 45, bottom: -45, near: 5, far: 140 });
+    sun.shadow.bias = -5e-4;
+    sun.shadow.camera.updateProjectionMatrix();
+    scene.add(sun);
+    const fill = new THREE.DirectionalLight(9417983, 0.35);
+    fill.position.set(-30, 20, -20);
+    scene.add(fill);
+    this.buildBench();
+    this.buildArm();
+    this.buildConveyor();
+    this.buildSensor();
+    this.buildTrays();
+    this.capMeshes = /* @__PURE__ */ new Map();
+    const ro = new ResizeObserver(() => this.resize());
+    ro.observe(container);
+    this.resize();
+  }
+  setView(v) {
+    const C2 = this.camera, T = this.controls.target;
+    const views = {
+      persp: [[0, 38, 54], [0, 4, 6]],
+      top: [[0, 78, 6.01], [0, 0, 6]],
+      front: [[0, 12, 62], [0, 6, 4]],
+      side: [[60, 16, 6], [0, 6, 6]]
+    };
+    const [p, t] = views[v] || views.persp;
+    C2.position.set(...p);
+    T.set(...t);
+    this.controls.update();
+  }
+  resize() {
+    const w = this.container.clientWidth, h = Math.max(1, this.container.clientHeight);
+    this.renderer.setSize(w, h, false);
+    this.renderer.domElement.style.width = "100%";
+    this.renderer.domElement.style.height = "100%";
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+  }
+  buildBench() {
+    const s = this.scene;
+    s.add(box(96, 2, 80, MAT.bench, 0, -1, 14));
+    const grid = new THREE.GridHelper(96, 48, 4015698, 2896442);
+    grid.position.set(0, 0.012, 14);
+    grid.material.transparent = true;
+    grid.material.opacity = 0.7;
+    s.add(grid);
+    s.add(box(16, 0.4, 14, MAT.acrylic, 0, 0.2, -1.5));
+    for (const [x, z] of [[-7, -7.5], [7, -7.5], [-7, 4.5], [7, 4.5]]) {
+      const sc = cyl(0.35, 0.2, MAT.screw, 12);
+      sc.position.set(x, 0.5, z);
+      s.add(sc);
+    }
+    const uno = new THREE.Group();
+    uno.position.set(-16, 0, -11);
+    uno.add(box(6.86, 0.16, 5.34, MAT.pcbBlue, 0, 0.6, 0));
+    for (const [x, z] of [[-3, -2.2], [3, -2.2], [-3, 2.2], [3, 2.2]]) {
+      const st = cyl(0.18, 0.52, MAT.metal, 10);
+      st.position.set(x, 0.26, z);
+      uno.add(st);
+    }
+    uno.add(box(3.4, 0.35, 0.9, MAT.chip, 0.6, 0.86, 0.8));
+    uno.add(box(1.2, 1, 1.6, MAT.metal, -3.1, 1.1, -1.2));
+    uno.add(box(1.4, 1.1, 0.9, MAT.chip, -3, 1.1, 1.8));
+    uno.add(box(4.6, 0.8, 0.25, MAT.chip, 0.6, 1.08, -2.45));
+    uno.add(box(4, 0.8, 0.25, MAT.chip, 0.9, 1.08, 2.45));
+    s.add(uno);
+    const ul = label("ARDUINO UNO", "#7d8b99", 8, 1.4);
+    ul.position.set(-16, 0.03, -6.8);
+    s.add(ul);
+    const bat = new THREE.Group();
+    bat.position.set(16, 0, -11);
+    bat.add(box(7.8, 1, 4.4, MAT.chip, 0, 0.5, 0));
+    for (const z of [-1, 1]) {
+      const c = cyl(0.9, 6.5, new THREE.MeshStandardMaterial({ color: 3108670, roughness: 0.5 }), 24);
+      c.rotation.z = Math.PI / 2;
+      c.position.set(0, 1.4, z);
+      bat.add(c);
+    }
+    bat.add(box(2.4, 0.4, 2.2, MAT.pcbBlue, -7, 0.2, 0));
+    s.add(bat);
+    const bl = label("2S 7.4V \u2192 5V REG", "#7d8b99", 10, 1.4);
+    bl.position.set(16, 0.03, -6.8);
+    s.add(bl);
+  }
+  buildConveyor() {
+    const s = this.scene, C2 = GEOM.CONVEYOR;
+    const g = new THREE.Group();
+    const len = C2.startZ - C2.endZ;
+    const midZ = (C2.startZ + C2.endZ) / 2;
+    const bed = box(C2.width, C2.height, len, MAT.acrylic, 0, C2.height / 2, midZ);
+    g.add(bed);
+    const beltMat = new THREE.MeshStandardMaterial({ color: 2040877, roughness: 0.85, metalness: 0.1 });
+    const belt = new THREE.Mesh(new THREE.PlaneGeometry(C2.width - 0.4, len - 0.2), beltMat);
+    belt.rotation.x = -Math.PI / 2;
+    belt.position.set(0, C2.height + 0.015, midZ);
+    g.add(belt);
+    this.conveyorBelt = belt;
+    for (const side of [-1, 1]) {
+      const rail = box(0.3, 1.2, len, MAT.metal, side * (C2.width / 2 + 0.15), 0.6, midZ);
+      g.add(rail);
+      for (const z of [C2.endZ + 2, midZ, C2.startZ - 2]) {
+        const leg = cyl(0.35, C2.height, MAT.bracket, 12);
+        leg.position.set(side * (C2.width / 2 + 0.15), C2.height / 2, z);
+        g.add(leg);
+      }
+    }
+    const roller = cyl(C2.width / 2 - 0.1, 0.7, MAT.metal, 24);
+    roller.rotation.z = Math.PI / 2;
+    roller.position.set(0, C2.height / 2, C2.startZ);
+    g.add(roller);
+    const cl = label("CONVEYOR INFEED \u2192 SENSOR", "#7aa2d6", 15, 1.6);
+    cl.position.set(0, 0.03, C2.startZ + 4);
+    s.add(cl);
+    s.add(g);
+  }
+  buildArm() {
+    const G = GEOM, s = this.scene;
+    const baseTop = 3.4;
+    const root = new THREE.Group();
+    s.add(root);
+    const housing = cyl(5, baseTop - 0.4, MAT.mdf, 48);
+    housing.position.y = 0.4 + (baseTop - 0.4) / 2;
+    root.add(housing);
+    const bs = sg90(false);
+    bs.rotation.z = Math.PI / 2;
+    bs.position.set(0, 2, -5.2);
+    root.add(bs);
+    const yaw = this.yawG = new THREE.Group();
+    yaw.position.y = baseTop;
+    root.add(yaw);
+    const tt = cyl(4.6, 0.5, MAT.mdfLight, 48);
+    tt.position.y = 0.25;
+    yaw.add(tt);
+    const brH = G.H - baseTop + 0.9;
+    for (const x of [-2, 2]) yaw.add(box(0.4, brH, 3, MAT.mdf, x, 0.5 + brH / 2 - 0.1, 0));
+    const ss = sg90();
+    ss.position.set(2.85, G.H - baseTop, -0.55);
+    yaw.add(ss);
+    const sh = this.shoulderG = new THREE.Group();
+    sh.position.y = G.H - baseTop;
+    yaw.add(sh);
+    const hub = cyl(0.9, 3.6, MAT.horn, 24);
+    hub.rotation.z = Math.PI / 2;
+    sh.add(hub);
+    for (const x of [-1.3, 1.3]) sh.add(box(0.35, G.L1 + 1.6, 1.6, MAT.mdfLight, x, G.L1 / 2, 0));
+    for (const y of [G.L1 * 0.33, G.L1 * 0.66]) {
+      const sp = cyl(0.22, 2.6, MAT.metal, 10);
+      sp.rotation.z = Math.PI / 2;
+      sp.position.y = y;
+      sh.add(sp);
+    }
+    const el = this.elbowG = new THREE.Group();
+    el.position.y = G.L1;
+    sh.add(el);
+    const es = sg90();
+    es.position.set(2.15, 0, -0.55);
+    el.add(es);
+    const eh = cyl(0.75, 3, MAT.horn, 24);
+    eh.rotation.z = Math.PI / 2;
+    el.add(eh);
+    for (const x of [-0.85, 0.85]) el.add(box(0.35, G.L2 + 1.2, 1.4, MAT.mdf, x, G.L2 / 2, 0));
+    const fsp = cyl(0.2, 1.8, MAT.metal, 10);
+    fsp.rotation.z = Math.PI / 2;
+    fsp.position.y = G.L2 * 0.5;
+    el.add(fsp);
+    const wr = this.wristG = new THREE.Group();
+    wr.position.y = G.L2;
+    el.add(wr);
+    const wh = cyl(0.6, 2.2, MAT.horn, 20);
+    wh.rotation.z = Math.PI / 2;
+    wr.add(wh);
+    wr.add(box(1, 1.6, 1, MAT.mdf, 0, -0.8, 0));
+    wr.add(box(5, 0.4, 2.6, MAT.mdfLight, 0, -1.7, 0));
+    const gs = sg90();
+    gs.rotation.z = Math.PI / 2;
+    gs.position.set(-0.4, -1, -1.9);
+    gs.scale.setScalar(0.9);
+    wr.add(gs);
+    const rail = cyl(0.12, 5.2, MAT.metal, 8);
+    rail.rotation.z = Math.PI / 2;
+    rail.position.set(0, -2.1, 0);
+    wr.add(rail);
+    this.fingers = [];
+    const fTop = -1.9, fBot = -(G.LG + 0.5);
+    for (const side of [-1, 1]) {
+      const f = new THREE.Group();
+      f.add(box(0.35, fTop - fBot, 1.6, MAT.mdf, 0, (fTop + fBot) / 2, 0));
+      f.add(box(0.15, 2, 1.4, MAT.rubber, -side * 0.25, fBot + 1.1, 0));
+      f.userData.side = side;
+      wr.add(f);
+      this.fingers.push(f);
+    }
+    this.marker = new THREE.Mesh(new THREE.SphereGeometry(0.28, 16, 12), new THREE.MeshBasicMaterial({ color: 3718648 }));
+    this.marker.visible = false;
+    s.add(this.marker);
+  }
+  buildSensor() {
+    const s = this.scene, P = GEOM.PAD;
+    const pad = cyl(P.r, P.h, MAT.pad, 40);
+    pad.position.set(P.x, P.h / 2, P.z);
+    s.add(pad);
+    const ring = new THREE.Mesh(new THREE.RingGeometry(P.r + 0.15, P.r + 0.4, 48), new THREE.MeshBasicMaterial({ color: 3900150, transparent: true, opacity: 0.8 }));
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.set(P.x, 0.02, P.z);
+    s.add(ring);
+    this.padRing = ring;
+    const pl = label("PICKUP \xB7 TCS34725", "#7fa7d9", 11, 1.6);
+    pl.position.set(0, 0.03, P.z + 9.2);
+    s.add(pl);
+    const sx = 0, sy = 6.3, sz = P.z + 2.4;
+    s.add(box(0.8, 7.4, 0.8, MAT.bracket, 0, 3.7, P.z + 6.2));
+    s.add(box(0.6, 0.6, 4.4, MAT.bracket, 0, 7.1, P.z + 4.2));
+    s.add(box(2.2, 0.3, 2.2, MAT.bracket, 0, 0.15, P.z + 6.2));
+    const head = this.sensorHead = new THREE.Group();
+    head.position.set(sx, sy, sz);
+    const dir = new THREE.Vector3(P.x - sx, P.h + GEOM.CAP.h - sy, P.z - sz);
+    const tilt = Math.atan2(-dir.z, -dir.y);
+    head.rotation.x = tilt;
+    head.add(box(2, 0.16, 2, MAT.pcbPurple));
+    head.add(box(0.5, 0.18, 0.5, MAT.chip, 0.35, -0.12, 0));
+    this.led = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 0.14, 16), new THREE.MeshStandardMaterial({ color: 16777215, emissive: 16774872, emissiveIntensity: 0.2 }));
+    this.led.position.set(-0.4, -0.14, 0);
+    head.add(this.led);
+    const len = dir.length();
+    const cone = new THREE.Mesh(
+      new THREE.ConeGeometry(1.9, len, 40, 1, true),
+      new THREE.MeshBasicMaterial({ color: 10146303, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending })
+    );
+    cone.position.y = -len / 2;
+    head.add(cone);
+    this.cone = cone;
+    this.ledLight = new THREE.PointLight(16774096, 0, 12, 2);
+    this.ledLight.position.set(0, -0.5, 0);
+    head.add(this.ledLight);
+    s.add(head);
+  }
+  buildTrays() {
+    const T = GEOM.TRAY, t = 0.4, outer = T.inner + 2 * t;
+    for (const [binId, b] of Object.entries(BINS)) {
+      const f = binFrame(binId);
+      const g = new THREE.Group();
+      g.position.set(f.cx, 0, f.cz);
+      g.rotation.y = f.yaw;
+      g.add(box(outer, T.floor, outer, MAT.mdf, 0, T.floor / 2, 0));
+      const hw = T.inner / 2 + t / 2;
+      g.add(box(outer, T.wall, t, MAT.mdfLight, 0, T.wall / 2, hw));
+      g.add(box(outer, T.wall, t, MAT.mdfLight, 0, T.wall / 2, -hw));
+      g.add(box(t, T.wall, T.inner, MAT.mdfLight, hw, T.wall / 2, 0));
+      g.add(box(t, T.wall, T.inner, MAT.mdfLight, -hw, T.wall / 2, 0));
+      const rimCol = new THREE.Color(b.color);
+      const rimMat = new THREE.MeshStandardMaterial({ color: rimCol, roughness: 0.5 });
+      for (const [w, d, x, z] of [[outer, t, 0, hw], [outer, t, 0, -hw], [t, T.inner, hw, 0], [t, T.inner, -hw, 0]]) {
+        const st = box(w + 0.02, 0.16, d + 0.02, rimMat, x, T.wall + 0.08, z);
+        g.add(st);
+      }
+      const lb = label(b.label.toUpperCase(), b.color, 8, 1.5);
+      lb.position.set(f.cx, 0.03, f.cz + hw + 2.2);
+      this.scene.add(lb);
+      this.scene.add(g);
+    }
+  }
+  syncCaps() {
+    const sim2 = this.sim, seen = /* @__PURE__ */ new Set();
+    for (const c of sim2.caps) {
+      seen.add(c.id);
+      let m = this.capMeshes.get(c.id);
+      if (!m) {
+        m = new THREE.Group();
+        const mat = new THREE.MeshStandardMaterial({ color: new THREE.Color(c.hex), roughness: 0.45 });
+        const body = new THREE.Mesh(new THREE.CylinderGeometry(GEOM.CAP.r, GEOM.CAP.r * 0.97, GEOM.CAP.h, 48), mat);
+        body.castShadow = body.receiveShadow = true;
+        m.add(body);
+        const top = new THREE.Mesh(new THREE.CircleGeometry(GEOM.CAP.r * 0.82, 40), new THREE.MeshStandardMaterial({ color: new THREE.Color(c.hex).multiplyScalar(0.8), roughness: 0.6 }));
+        top.rotation.x = -Math.PI / 2;
+        top.position.y = GEOM.CAP.h / 2 + 5e-3;
+        m.add(top);
+        for (let i = 0; i < 24; i++) {
+          const a = i / 24 * Math.PI * 2;
+          const rb = new THREE.Mesh(new THREE.BoxGeometry(0.12, GEOM.CAP.h * 0.8, 0.12), mat);
+          rb.position.set(Math.cos(a) * GEOM.CAP.r, 0, Math.sin(a) * GEOM.CAP.r);
+          m.add(rb);
+        }
+        this.scene.add(m);
+        this.capMeshes.set(c.id, m);
+      }
+      m.position.set(c.pos.x, c.pos.y, c.pos.z);
+    }
+    for (const [id, m] of this.capMeshes) if (!seen.has(id)) {
+      this.scene.remove(m);
+      this.capMeshes.delete(id);
+    }
+  }
+  sync(time) {
+    const sim2 = this.sim, j = sim2.motion.angles();
+    const a = shoulderPitch(j.shoulder), b = elbowPitch(j.elbow);
+    this.yawG.rotation.y = yawOf(j.base);
+    this.shoulderG.rotation.x = a;
+    this.elbowG.rotation.x = b;
+    this.wristG.rotation.x = -(a + b);
+    let gap = fingerGap(j.gripper);
+    if (sim2.heldCap) gap = Math.max(gap, 2 * GEOM.CAP.r);
+    for (const f of this.fingers) f.position.x = f.userData.side * (gap / 2 + 0.175);
+    const g = fk(j).grip;
+    this.marker.position.set(g.x, g.y, g.z);
+    const st = sim2.sensorStatus;
+    const scanning = st === "SCANNING";
+    const on = scanning || st === "POLLING" || st === "LIVE" || st === "CLASSIFIED";
+    this.led.material.emissiveIntensity = on ? scanning ? 1.6 : 0.9 : 0.15;
+    this.ledLight.intensity = on ? scanning ? 6 : 2.5 : 0;
+    this.cone.material.opacity = scanning ? 0.1 + 0.08 * Math.sin(time * 14) : st === "CLASSIFIED" ? 0.06 : 0;
+    this.padRing.material.color.setHex(scanning ? 3718648 : sim2.state === "ERROR" ? 15680580 : 3900150);
+    this.syncCaps();
+    if (this.conveyorBelt) {
+      const activeConveyor = this.sim.caps.some((c) => c.state === "conveyor");
+      const offset = activeConveyor ? time * 1.5 % 1 : 0;
+      this.conveyorBelt.material.color.setHex(activeConveyor ? 2633789 : 2040877);
+    }
+    this.controls.update();
+    this.renderer.render(this.scene, this.camera);
+  }
+};
+
+// src/hardware.js
+var C = { raw: "#f97316", v5: "#ef4444", gnd: "#9ca3af", sig: "#facc15", sda: "#38bdf8", scl: "#a78bfa", box: "#1c2025", edge: "#3a424c", tx: "#d6dce4", tx2: "#8a96a3" };
+function blk(x, y, w, h, title, sub, accent) {
+  return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="6" fill="${C.box}" stroke="${accent || C.edge}" stroke-width="1.5"/>
+  <text x="${x + 12}" y="${y + 22}" fill="${C.tx}" font-size="14" font-weight="600">${title}</text>
+  ${sub ? `<text x="${x + 12}" y="${y + 40}" fill="${C.tx2}" font-size="11">${sub}</text>` : ""}`;
+}
+function pin(x, y, name, anchor = "start", dx = 8) {
+  const tx = anchor === "start" ? x + dx : x - dx;
+  return `<circle cx="${x}" cy="${y}" r="3.5" fill="#0f1114" stroke="${C.tx2}" stroke-width="1.3"/>
+  <text x="${tx}" y="${y + 4}" fill="${C.tx2}" font-size="11" text-anchor="${anchor}">${name}</text>`;
+}
+var wire = (pts, col, w = 2.2, dash = "") => `<polyline points="${pts.map((p) => p.join(",")).join(" ")}" fill="none" stroke="${col}" stroke-width="${w}" stroke-linejoin="round" ${dash ? `stroke-dasharray="${dash}"` : ""}/>`;
+var jn = (x, y, col) => `<circle cx="${x}" cy="${y}" r="4.5" fill="${col}"/>`;
+var tag = (x, y, t, col, anchor = "start") => `<text x="${x}" y="${y}" fill="${col}" font-size="11" font-weight="600" text-anchor="${anchor}">${t}</text>`;
+function hardwareSVG() {
+  const servos = [["SERVO 1 \xB7 BASE", "D3", 190, 300], ["SERVO 2 \xB7 SHOULDER", "D5", 290, 350], ["SERVO 3 \xB7 ELBOW", "D6", 390, 400], ["SERVO 4 \xB7 GRIPPER", "D9", 490, 450]];
+  let s = `<svg viewBox="0 0 1200 700" xmlns="http://www.w3.org/2000/svg" font-family="IBM Plex Mono, monospace">`;
+  s += blk(40, 40, 180, 100, "2S BATTERY PACK", "7.4 V nominal \xB7 8.4 V full", "#7c4a14");
+  s += blk(340, 40, 200, 100, "5 V REGULATOR", "buck / UBEC \xB7 \u2265 3 A", "#5b2626");
+  s += blk(360, 230, 240, 330, "ARDUINO UNO", "ATmega328P \xB7 PlatformIO C++", "#155e75");
+  s += blk(40, 330, 190, 190, "TCS34725", "RGB colour sensor \xB7 I\xB2C 0x29", "#4c1d95");
+  s += pin(220, 100, "+", "end") + pin(220, 125, "\u2212", "end");
+  s += pin(340, 100, "IN+") + pin(340, 125, "IN\u2212") + pin(540, 100, "OUT+", "end") + pin(540, 125, "OUT\u2212", "end");
+  s += wire([[220, 100], [340, 100]], C.raw, 3.2);
+  s += tag(236, 92, "7.4 V RAW", C.raw);
+  s += wire([[290, 100], [290, 200], [400, 200], [400, 230]], C.raw, 3.2) + jn(290, 100, C.raw);
+  s += tag(298, 192, "VIN 7\u201312 V", C.raw);
+  s += wire([[220, 125], [340, 125]], C.gnd, 2.4);
+  s += wire([[540, 100], [1120, 100], [1120, 620]], C.v5, 3.4);
+  s += tag(700, 92, "SERVO +5 V RAIL (REGULATED)", C.v5);
+  s += wire([[540, 125], [1080, 125], [1080, 620]], C.gnd, 3);
+  s += tag(700, 142, "COMMON GND", C.gnd);
+  s += wire([[1080, 640], [1094, 640]], C.gnd, 2) + wire([[1106, 640], [1120, 640]], C.v5, 2);
+  s += `<line x1="1094" y1="628" x2="1094" y2="652" stroke="${C.tx}" stroke-width="2.5"/><path d="M1106 628 Q1100 640 1106 652" fill="none" stroke="${C.tx}" stroke-width="2.5"/>`;
+  s += wire([[1080, 620], [1080, 640]], C.gnd, 2) + wire([[1120, 620], [1120, 640]], C.v5, 2);
+  s += tag(1100, 676, "470\u20131000 \xB5F", C.tx2, "middle");
+  s += pin(400, 230, "VIN", "start", 8).replace(`y="234"`, `y="222"`);
+  s += pin(580, 230, "GND", "end", 8).replace(`y="234"`, `y="222"`);
+  s += wire([[580, 230], [580, 125]], C.gnd, 2.4) + jn(580, 125, C.gnd);
+  const leftPins = [["5V", 400, C.v5], ["GND", 430, C.gnd], ["A4 \xB7 SDA", 460, C.sda], ["A5 \xB7 SCL", 490, C.scl]];
+  const sensPins = ["VIN", "GND", "SDA", "SCL"];
+  leftPins.forEach(([n, y, col], i) => {
+    s += wire([[230, y], [360, y]], col, 2.4);
+    s += pin(360, y, n) + pin(230, y, sensPins[i], "end");
+  });
+  servos.forEach(([name, d, sy, py]) => {
+    s += pin(600, py, `${d} PWM`, "end");
+  });
+  servos.forEach(([name, d, sy, py], i) => {
+    const lane = 700 + i * 12, sigY = sy + 30;
+    s += blk(820, sy, 170, 60, name, "SG90 \xB7 4.8\u20136 V", "#1e40af");
+    s += wire([[600, py], [lane, py], [lane, sigY], [820, sigY]], C.sig, 2.2);
+    s += pin(820, sigY, "");
+    s += wire([[990, sy + 18], [1120, sy + 18]], C.v5, 2.2) + jn(1120, sy + 18, C.v5);
+    s += wire([[990, sy + 42], [1080, sy + 42]], C.gnd, 2.2) + jn(1080, sy + 42, C.gnd);
+    s += `<text x="996" y="${sy + 14}" fill="${C.v5}" font-size="10">+5V</text><text x="996" y="${sy + 56}" fill="${C.gnd}" font-size="10">GND</text>`;
+  });
+  const L = [["Raw battery 7.4 V", C.raw], ["Regulated 5 V", C.v5], ["Ground (common)", C.gnd], ["Servo PWM signal", C.sig], ["I\xB2C SDA", C.sda], ["I\xB2C SCL", C.scl]];
+  s += `<text x="40" y="575" fill="${C.tx2}" font-size="11" font-weight="600">LEGEND</text>`;
+  L.forEach(([t, col], i) => {
+    const x = 40 + i % 2 * 170, y = 600 + Math.floor(i / 2) * 24;
+    s += `<line x1="${x}" y1="${y}" x2="${x + 30}" y2="${y}" stroke="${col}" stroke-width="3"/><text x="${x + 38}" y="${y + 4}" fill="${C.tx}" font-size="11">${t}</text>`;
+  });
+  s += `<rect x="380" y="590" width="460" height="74" rx="5" fill="#1f1708" stroke="#6b4a12"/>
+  <text x="394" y="612" fill="#fde68a" font-size="11.5" font-weight="600">RULE: raw 2S never connects to the servo rail.</text>
+  <text x="394" y="632" fill="#e7d9a8" font-size="11">Battery \u2192 regulator \u2192 +5 V rail \u2192 servos.</text>
+  <text x="394" y="650" fill="#e7d9a8" font-size="11">Battery \u2192 UNO VIN only (on-board regulator makes 5 V logic).</text>`;
+  s += `</svg>`;
+  return s;
+}
+
+// src/ui.js
+var $ = (id) => document.getElementById(id);
+var pad2 = (n) => String(n).padStart(2, "0");
+var clock = () => {
+  const d = /* @__PURE__ */ new Date();
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+};
+var esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+var JNAME = { base: ["BASE", "S1 \xB7 D3"], shoulder: ["SHOULDER", "S2 \xB7 D5"], elbow: ["ELBOW", "S3 \xB7 D6"], gripper: ["GRIPPER", "S4 \xB7 D9"] };
+async function copyText(text, okMsg, log) {
+  try {
+    await navigator.clipboard.writeText(text);
+    log("ok", okMsg);
+  } catch {
+    log("warn", "Clipboard blocked by the browser. Text printed to the log instead.");
+    log("data", text);
+  }
+}
+var DemoRunner = class {
+  constructor(sim2, ui2) {
+    this.sim = sim2;
+    this.ui = ui2;
+    this.q = null;
+  }
+  busy() {
+    return this.sim.state !== "IDLE" || this.sim.caps.some((c) => ["falling", "spawning", "held"].includes(c.state));
+  }
+  prep() {
+    const s = this.sim;
+    if (s.state === "ERROR") s.reset();
+    if (this.busy()) {
+      s.log("warn", "Robot busy. Wait for the current cycle or press RESET.");
+      return false;
+    }
+    if (s.padCap()) s.removePadCap();
+    s.awaitPadClear = false;
+    s.start();
+    return true;
+  }
+  single(kind) {
+    this.q = null;
+    if (!this.prep()) return;
+    this.sim.log("info", `DEMO: loading ${kind} cap onto conveyor.`);
+    this.sim.spawnCap(kind, null, true);
+    this.ui.setDemo(`${kind} demo running\u2026`);
+    this.q = { items: [], cur: { kind, phase: "run" }, t: 0, single: true };
+  }
+  full() {
+    this.q = null;
+    if (!this.prep()) return;
+    this.sim.log("info", "DEMO: complete conveyor sorting run (RED, GREEN, BLUE, UNKNOWN).");
+    this.q = { items: ["RED", "GREEN", "BLUE", "RANDOM"], cur: null, t: 0 };
+  }
+  stop(msg) {
+    if (this.q) {
+      this.q = null;
+      this.ui.setDemo(msg);
+    }
+  }
+  update(dt) {
+    const q = this.q, s = this.sim;
+    if (!q || s.paused) return;
+    if (s.state === "ERROR") {
+      this.sim.log("error", "Demo aborted because of ERROR.");
+      this.stop("Demo aborted (error).");
+      return;
+    }
+    if (s.mode !== "AUTO" || !s.running) {
+      this.stop("Demo stopped.");
+      return;
+    }
+    if (q.cur) {
+      if (!this.busy() && !s.padCap() && !s.caps.some((c) => c.state === "conveyor")) {
+        q.t += dt;
+        if (q.t > 1) {
+          q.cur = null;
+          q.t = 0;
+        }
+      }
+      return;
+    }
+    if (!q.items.length) {
+      s.log("ok", q.single ? "DEMO finished." : "DEMO: complete sorting sequence finished.");
+      this.stop(`Demo finished. Red ${s.stats.red} \xB7 Green ${s.stats.green} \xB7 Blue ${s.stats.blue} \xB7 Unknown ${s.stats.unknown}.`);
+      return;
+    }
+    const k = q.items.shift();
+    q.cur = { kind: k };
+    q.t = 0;
+    this.ui.setDemo(`Conveyor sorting demo: loading ${k} cap\u2026`);
+    s.spawnCap(k, null, true);
+  }
+};
+var Dashboard = class {
+  constructor(sim2, view2) {
+    this.sim = sim2;
+    this.view = view2;
+    this.visited = /* @__PURE__ */ new Set();
+    this.demo = new DemoRunner(sim2, this);
+    this.logLines = [];
+    this.buildStatic();
+    this.bind();
+    sim2.on((type, d) => this.onEvent(type, d));
+    this.renderStates();
+    this.renderSensor();
+    this.renderStats();
+    this.renderMode();
+    this.lastRefresh = 0;
+  }
+  // ---------- events from the simulation
+  onEvent(type, d) {
+    if (type === "log") this.addLog(d.level, d.msg, d.t);
+    else if (type === "state") {
+      if (d.next === "IDLE" || d.next === "DETECTING_CAP") this.visited.clear();
+      this.visited.add(d.prev);
+      this.renderStates();
+      this.renderMode();
+    } else if (type === "reading") {
+      this.lastReading = d;
+      this.renderSensor();
+    } else if (type === "stats") this.renderStats();
+    else if (type === "mode") this.renderMode();
+    else if (type === "cmd" && $("showCmd").checked) this.addLog("cmd", `CMD base=${d.base.toFixed(0)} shoulder=${d.shoulder.toFixed(0)} elbow=${d.elbow.toFixed(0)} gripper=${d.gripper.toFixed(0)}`, this.sim.time);
+  }
+  addLog(level, msg, t) {
+    const el = $("log");
+    const line = `[${clock()}] [t=${t.toFixed(2).padStart(6)}s] ${msg}`;
+    this.logLines.push(line);
+    const div = document.createElement("div");
+    div.className = level === "state" ? "st" : level;
+    div.innerHTML = `<span class="ts">[${clock()}] t=${t.toFixed(2).padStart(6)}s</span>  ${esc(msg)}`;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
+    el.appendChild(div);
+    while (el.childNodes.length > 600) el.removeChild(el.firstChild);
+    if (this.logLines.length > 2e3) this.logLines.shift();
+    if (atBottom) el.scrollTop = el.scrollHeight;
+  }
+  setDemo(t) {
+    $("demoStatus").textContent = t;
+  }
+  // ---------- static construction
+  buildStatic() {
+    const J = $("joints");
+    J.innerHTML = JOINTS.map((k) => `
+      <div class="joint"><div class="nm">${JNAME[k][0]}<small>${JNAME[k][1]}</small></div>
+      <input type="range" id="j_${k}" step="1"><div class="v" id="jv_${k}">0\xB0</div>
+      <div class="t"><span id="jl_${k}"></span><span id="jt_${k}"></span></div></div>`).join("");
+    const meter = (id, k, col) => `<div class="meter"><span class="k">${k}</span><div class="bar"><i id="${id}" style="background:${col}"></i><span id="${id}_m"></span></div><span class="n" id="${id}_v">0</span></div>`;
+    $("rawM").innerHTML = meter("mR", "R", "#ef4444") + meter("mG", "G", "#22c55e") + meter("mB", "B", "#3b82f6") + meter("mC", "C", "#d1d5db");
+    $("normM").innerHTML = meter("nR", "nr", "#ef4444") + meter("nG", "ng", "#22c55e") + meter("nB", "nb", "#3b82f6");
+    $("states").innerHTML = STATES.map((s, i) => `<li id="s_${s}" class="${s}"><span class="ix">${String(i + 1).padStart(2, "0")}</span>${s}</li>`).join("");
+    $("hwSvg").innerHTML = hardwareSVG();
+    if (window.lucide) try {
+      window.lucide.createIcons();
+    } catch {
+    }
+  }
+  bind() {
+    const s = this.sim;
+    $("bStart").onclick = () => {
+      if (s.paused) s.setPaused(false);
+      s.start();
+    };
+    $("bPause").onclick = () => s.setPaused(!s.paused);
+    $("bReset").onclick = () => {
+      this.demo.stop("Demo stopped.");
+      s.reset();
+    };
+    $("errReset").onclick = () => {
+      this.demo.stop("Demo stopped.");
+      s.reset();
+    };
+    $("bHome").onclick = () => s.home();
+    $("mAuto").onclick = () => s.setMode("AUTO");
+    $("mMan").onclick = () => {
+      this.demo.stop("Demo stopped (manual mode).");
+      s.setMode("MANUAL");
+    };
+    $("speed").oninput = (e) => {
+      s.motion.speed = +e.target.value;
+      $("speedV").textContent = (+e.target.value).toFixed(2) + "\xD7";
+    };
+    $("dRed").onclick = () => this.demo.single("RED");
+    $("dGreen").onclick = () => this.demo.single("GREEN");
+    $("dBlue").onclick = () => this.demo.single("BLUE");
+    $("dAll").onclick = () => this.demo.full();
+    $("dReset").onclick = () => {
+      this.demo.stop("Scene reset.");
+      s.resetScene();
+    };
+    $("dClear").onclick = () => s.clearTrays();
+    document.querySelectorAll("[data-cap]").forEach((b) => b.onclick = () => s.spawnCap(b.dataset.cap, null, true));
+    $("bCustom").onclick = () => s.spawnCap("CUSTOM", $("customCol").value, true);
+    $("bRemove").onclick = () => s.removePadCap();
+    $("bSeq").onclick = () => s.playSequence();
+    $("bSeqStop").onclick = () => {
+      s.stopSequence();
+      s.motion.halt();
+    };
+    for (const k of JOINTS) $("j_" + k).oninput = (e) => s.manualJoint(k, +e.target.value);
+    document.querySelectorAll("[data-cam]").forEach((b) => b.onclick = () => {
+      this.view.setView(b.dataset.cam);
+      document.querySelectorAll("[data-cam]").forEach((x) => x.classList.toggle("on", x === b));
+    });
+    $("bMarker").onclick = (e) => {
+      this.view.marker.visible = !this.view.marker.visible;
+      e.currentTarget.classList.toggle("on", this.view.marker.visible);
+    };
+    $("logClear").onclick = () => {
+      $("log").innerHTML = "";
+      this.logLines = [];
+    };
+    $("logCopy").onclick = () => copyText(this.logLines.join("\n"), "Log copied to clipboard.", (l, m) => s.log(l, m));
+    document.querySelectorAll(".tab").forEach((t) => t.onclick = () => {
+      document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("on", x === t));
+      document.querySelectorAll(".view").forEach((v) => v.classList.toggle("on", v.id === t.dataset.view));
+      if (t.dataset.view === "simView") this.view.resize();
+    });
+  }
+  // ---------- renderers
+  renderMode() {
+    const s = this.sim, man = s.mode === "MANUAL";
+    $("mAuto").classList.toggle("on", !man);
+    $("mMan").classList.toggle("on", man);
+    $("bPause").innerHTML = s.paused ? '<i data-lucide="play"></i>RESUME' : '<i data-lucide="pause"></i>PAUSE';
+    $("bStart").disabled = !man && s.running;
+    $("jointMode").textContent = man ? "MANUAL \xB7 LIVE" : "AUTO \xB7 READ ONLY";
+    for (const k of JOINTS) {
+      const el = $("j_" + k), L = s.cfg.limits[k];
+      el.disabled = !man;
+      el.min = L.min;
+      el.max = L.max;
+      $("jl_" + k).textContent = `${L.min}\xB0\u2013${L.max}\xB0`;
+    }
+    $("bSeq").disabled = !man;
+    $("bSeqStop").disabled = !man;
+    $("pausedTag").style.display = s.paused ? "block" : "none";
+    const err = s.state === "ERROR";
+    $("errBox").classList.toggle("on", err);
+    $("errMsg").textContent = s.error;
+    const runTxt = man ? "MANUAL" : s.running ? "AUTOMATIC \xB7 RUNNING" : "AUTOMATIC \xB7 STOPPED (press START)";
+    $("statePill").innerHTML = `${s.state}<small>${runTxt}${s.paused ? " \xB7 PAUSED" : ""}</small>`;
+    $("statePill").classList.toggle("err", err);
+    const hp = $("hdrState");
+    hp.textContent = s.state;
+    hp.className = "pill" + (err ? " err" : s.state === "SORTING_COMPLETE" ? " ok" : "");
+    $("stState").textContent = s.state;
+    if (window.lucide) try {
+      window.lucide.createIcons();
+    } catch {
+    }
+  }
+  renderStates() {
+    const cur = this.sim.state;
+    for (const st of STATES) {
+      const li = $("s_" + st);
+      li.classList.toggle("on", st === cur);
+      li.classList.toggle("done", st !== cur && this.visited.has(st));
+    }
+  }
+  renderSensor() {
+    const s = this.sim, rd = s.reading, res = s.result, th = s.cfg.thresholds;
+    const setM = (id, v, max, txt, mark) => {
+      $(id).style.width = Math.min(100, v / max * 100) + "%";
+      $(id + "_v").textContent = txt;
+      $(id + "_m").innerHTML = mark !== void 0 ? mark.map((m) => `<b style="left:${m * 100}%"></b>`).join("") : "";
+    };
+    setM("mR", rd.r, 1600, rd.r);
+    setM("mG", rd.g, 1600, rd.g);
+    setM("mB", rd.b, 1600, rd.b);
+    setM("mC", rd.c, 2e3, rd.c, [th.clearMin / 2e3]);
+    setM("nR", res.n.nr, 1, res.n.nr.toFixed(3), [th.redNrMin, th.greenNrMax, th.blueNrMax || 0.25]);
+    setM("nG", res.n.ng, 1, res.n.ng.toFixed(3), [th.redNgMax, th.greenNgMin]);
+    setM("nB", res.n.nb, 1, res.n.nb.toFixed(3), [th.greenNbMax, th.blueNbMin || 0.42]);
+    const colors = { RED: "#dc2626", GREEN: "#16a34a", BLUE: "#2563eb", UNKNOWN: "#d97706", "NO CAP": "#0d0e10" };
+    const sum = rd.r + rd.g + rd.b || 1;
+    $("detSw").style.background = res.label === "NO CAP" ? colors["NO CAP"] : `rgb(${Math.round(255 * rd.r / sum * 1.6)},${Math.round(255 * rd.g / sum * 1.6)},${Math.round(255 * rd.b / sum * 1.6)})`;
+    const L = $("detL");
+    L.textContent = res.label === "NO CAP" ? "NO CAP DETECTED" : res.label;
+    L.style.color = res.label === "NO CAP" ? "#6b7280" : colors[res.label];
+    $("detS").textContent = this.lastReading && this.lastReading.averaged ? `averaged over ${s.cfg.sensor.samples} samples` : "live reading";
+    const st = $("sStat");
+    st.textContent = s.sensorStatus;
+    st.className = "sstat " + s.sensorStatus;
+    const c = res.checks, n = res.n;
+    const r = (txt, ok) => `<tr><td>${txt}</td><td class="${ok ? "pass" : "fail"}">${ok ? "\u2713" : "\u2717"}</td></tr>`;
+    $("rules").innerHTML = `<tr class="grpH"><td colspan="2">PRESENCE</td></tr>` + r(`C = ${rd.c} \u2265 ${th.clearMin}`, c.clear) + `<tr class="grpH"><td colspan="2">RED \u2192 BIN 1</td></tr>` + r(`nr ${n.nr.toFixed(3)} &gt; ${th.redNrMin}`, c.redNr) + r(`ng ${n.ng.toFixed(3)} &lt; ${th.redNgMax}`, c.redNg) + `<tr class="grpH"><td colspan="2">GREEN \u2192 BIN 2</td></tr>` + r(`ng ${n.ng.toFixed(3)} &gt; ${th.greenNgMin}`, c.greenNg) + r(`nr ${n.nr.toFixed(3)} &lt; ${th.greenNrMax}`, c.greenNr) + r(`nb ${n.nb.toFixed(3)} &lt; ${th.greenNbMax}`, c.greenNb) + `<tr class="grpH"><td colspan="2">BLUE \u2192 BIN 3</td></tr>` + r(`nb ${n.nb.toFixed(3)} &gt; ${th.blueNbMin || 0.42}`, c.blueNb) + r(`nr ${n.nr.toFixed(3)} &lt; ${th.blueNrMax || 0.25}`, c.blueNr) + `<tr class="grpH"><td colspan="2">OTHERWISE \u2192 UNKNOWN (BIN 4)</td></tr><tr class="grpH"><td colspan="2">RESULT</td></tr><tr><td colspan="2" style="color:${res.label === "NO CAP" ? "#9ca3af" : colors[res.label]};font-weight:600">${res.label}</td></tr>`;
+  }
+  renderStats() {
+    const t = this.sim.stats;
+    $("stTotal").textContent = t.total;
+    $("stCycles").textContent = t.cycles;
+    $("stRed").textContent = t.red;
+    $("stGreen").textContent = t.green;
+    $("stBlue").textContent = t.blue || 0;
+    $("stUnk").textContent = t.unknown;
+    $("stErr").textContent = t.errors;
+  }
+  // called every frame, throttled
+  refresh(now) {
+    if (now - this.lastRefresh < 60) return;
+    this.lastRefresh = now;
+    const s = this.sim, a = s.motion.angles(), tg = s.motion.targets();
+    for (const k of JOINTS) {
+      $("jv_" + k).textContent = a[k].toFixed(1) + "\xB0";
+      $("jt_" + k).textContent = `target ${tg[k].toFixed(0)}\xB0`;
+      const el = $("j_" + k);
+      if (s.mode !== "MANUAL" || document.activeElement !== el) el.value = s.mode === "MANUAL" ? tg[k] : a[k];
+    }
+    const f = fk(a);
+    const gapCm = GEOM.GRIP.gapAtZero + a.gripper * GEOM.GRIP.gapPerDeg;
+    $("fkOut").innerHTML = `<span>x</span><span>${f.grip.x.toFixed(2)} cm</span><span>y</span><span>${f.grip.y.toFixed(2)} cm${f.grip.y < 0.6 ? " \u26A0 below pad" : ""}</span><span>z</span><span>${f.grip.z.toFixed(2)} cm</span><span>reach</span><span>${f.reach.toFixed(2)} cm</span><span>finger gap</span><span>${Math.min(6, gapCm).toFixed(2)} cm${s.heldCap ? " (holding cap)" : ""}</span>`;
+    if (this._st !== s.state || this._sens !== s.sensorStatus) {
+      this._st = s.state;
+      this._sens = s.sensorStatus;
+      this.renderMode();
+      this.renderSensor();
+    }
+  }
+};
+
+// src/main.js
+var sim = new Simulation();
+var view = new SceneView(document.getElementById("vp"), sim);
+var ui = new Dashboard(sim, view);
+window.__twinOK = true;
+window.__twin = { sim, view, ui };
+sim.log("info", "Sensor initialized: TCS34725 model (simulated, I\xB2C 0x29). Press START or run a demo.");
+var STEP = 1 / 120;
+var last = performance.now();
+function frame(now) {
+  let dt = Math.min(0.25, (now - last) / 1e3);
+  last = now;
+  ui.demo.update(sim.paused ? 0 : dt);
+  while (dt > 1e-6) {
+    const h = Math.min(STEP, dt);
+    sim.step(h);
+    dt -= h;
+  }
+  view.sync(now / 1e3);
+  ui.refresh(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
