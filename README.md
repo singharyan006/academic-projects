@@ -264,7 +264,7 @@ pio device monitor -b 9600
 
 ---
 
-## 👥 Student & Academic Contributions
+## Academic Contributions
 
 *Submitted in partial fulfilment of the requirements for the course **Introduction to Robotics** (Academic Year 2026–2027), Faculty of Engineering and Technology, **SRM Institute of Science and Technology**, Kattankulathur.*
 
