@@ -62,7 +62,7 @@ The system operates across a modular 5-layer robotics architecture:
 │    • TCS34725 16-bit RGBC Photodiode Array + IR filter (I²C 0x29)      │
 ├────────────────────────────────────────────────────────────────────────┤
 │ 3. COMMUNICATION LAYER                                                 │
-│    • Fast I²C Bus (SDA / SCL @ 400 kHz) for optical sensor data       │
+│    • Fast I²C Bus (SDA / SCL @ 400 kHz) for optical sensor data        │
 │    • USB Serial Interface (9600 baud) for diagnostics and event telemetry│
 ├────────────────────────────────────────────────────────────────────────┤
 │ 4. CONTROL (DECISION) LAYER                                            │
@@ -71,7 +71,7 @@ The system operates across a modular 5-layer robotics architecture:
 │    • Multi-sample averaging, noise rejection, & 14-state sequencer     │
 ├────────────────────────────────────────────────────────────────────────┤
 │ 5. ACTUATION LAYER                                                     │
-│    • 4× SG90 Servos (Base: Pin 3, Shoulder: Pin 5, Elbow: Pin 6,      │
+│    • 4× SG90 Servos (Base: Pin 3, Shoulder: Pin 5, Elbow: Pin 6,       │
 │      Gripper: Pin 9) controlled with smooth 50 Hz PWM interpolation    │
 └────────────────────────────────────────────────────────────────────────┘
 ```
