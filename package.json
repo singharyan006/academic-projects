@@ -4,6 +4,7 @@
   "description": "CapSortX: Automated Bottle Cap Sorting Robot - 4-DOF Robotic Arm Digital Twin & Physical Hardware",
   "private": true,
   "type": "module",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/singharyan006/capsortx.git"
